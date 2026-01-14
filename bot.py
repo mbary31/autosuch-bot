@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-AutoSuchBot (Kleinanzeigen + mobile.de) – robust & crash-sicher
-
-ENV Variablen (Railway -> Variables):
-- TELEGRAM_BOT_TOKEN   = dein Telegram Token
-- OPENAI_API_KEY       = optional (wird hier NICHT benötigt)
-
-WICHTIG requirements.txt:
-python-telegram-bot[job-queue]==21.6
-requests
-beautifulsoup4
-lxml
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -22,10 +8,9 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import quote_plus, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -40,26 +25,27 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# =========================
-# Config
-# =========================
-
+# =========================================================
+# ENV (Railway -> Variables)
+# =========================================================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()  # optional, not used here
 
+# =========================================================
+# Settings
+# =========================================================
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 STATE_FILE = DATA_DIR / "state.json"
 SEEN_FILE = DATA_DIR / "seen.json"
 
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))  # 5 min default
-MAX_SEND_PER_RUN = int(os.getenv("MAX_SEND_PER_RUN", "6"))  # max links per chat per check
-DETAIL_TIMEOUT = int(os.getenv("DETAIL_TIMEOUT", "20"))
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))  # 5 min
+MAX_SEND_PER_RUN = int(os.getenv("MAX_SEND_PER_RUN", "6"))
+
 LIST_TIMEOUT = int(os.getenv("LIST_TIMEOUT", "20"))
+DETAIL_TIMEOUT = int(os.getenv("DETAIL_TIMEOUT", "20"))
 
-# =========================
-# HTTP Session (retries)
-# =========================
-
+# =========================================================
+# HTTP session with retries
+# =========================================================
 SESSION = requests.Session()
 SESSION.headers.update(
     {
@@ -73,17 +59,17 @@ SESSION.headers.update(
 
 retry = Retry(
     total=4,
-    backoff_factor=0.9,
+    backoff_factor=0.8,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["GET"],
 )
 SESSION.mount("https://", HTTPAdapter(max_retries=retry))
 SESSION.mount("http://", HTTPAdapter(max_retries=retry))
 
-# =========================
-# Helpers: Storage
-# =========================
 
+# =========================================================
+# Storage helpers
+# =========================================================
 def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not STATE_FILE.exists():
@@ -125,36 +111,11 @@ def save_seen(seen: Dict[str, Any]) -> None:
     save_json(SEEN_FILE, seen)
 
 
-# =========================
-# Parsing / Validation
-# =========================
-
+# =========================================================
+# Parsing / Blocking detection
+# =========================================================
 PRICE_RE = re.compile(r"(\d[\d\.\s]*)(?:€|EUR)", re.IGNORECASE)
 YEAR_RE = re.compile(r"(19\d{2}|20\d{2})")
-
-
-def parse_price_eur(text: str) -> Optional[int]:
-    t = text.replace("\xa0", " ")
-    m = PRICE_RE.search(t)
-    if not m:
-        return None
-    digits = re.sub(r"\D", "", m.group(1))
-    return int(digits) if digits else None
-
-
-def parse_first_registration_year(text: str) -> Optional[int]:
-    t = text.replace("\xa0", " ")
-    keys = ["Erstzulassung", "EZ", "First registration", "Erst-Zulassung"]
-    for key in keys:
-        idx = t.lower().find(key.lower())
-        if idx != -1:
-            window = t[idx : idx + 260]
-            ym = YEAR_RE.search(window)
-            if ym:
-                return int(ym.group(1))
-    # fallback (nicht perfekt, aber besser als nix)
-    ym = YEAR_RE.search(t)
-    return int(ym.group(1)) if ym else None
 
 
 def looks_like_blocked(html: str) -> bool:
@@ -174,10 +135,32 @@ def looks_like_blocked(html: str) -> bool:
     return any(n in h for n in needles)
 
 
+def parse_price_eur(text: str) -> Optional[int]:
+    t = text.replace("\xa0", " ")
+    m = PRICE_RE.search(t)
+    if not m:
+        return None
+    digits = re.sub(r"\D", "", m.group(1))
+    return int(digits) if digits else None
+
+
+def parse_first_registration_year(text: str) -> Optional[int]:
+    t = text.replace("\xa0", " ")
+    # gezielt um "Erstzulassung/EZ"
+    for key in ["Erstzulassung", "EZ", "Erst-Zulassung", "First registration"]:
+        idx = t.lower().find(key.lower())
+        if idx != -1:
+            window = t[idx : idx + 260]
+            ym = YEAR_RE.search(window)
+            if ym:
+                return int(ym.group(1))
+    # fallback
+    ym = YEAR_RE.search(t)
+    return int(ym.group(1)) if ym else None
+
+
 def normalize_url(url: str) -> str:
-    url = url.strip()
-    # remove tracking fragments
-    url = url.split("#", 1)[0]
+    url = url.strip().split("#", 1)[0]
     return url
 
 
@@ -191,6 +174,9 @@ def dedupe_keep_order(urls: List[str]) -> List[str]:
     return out
 
 
+# =========================================================
+# Fetch (async wrapper around requests)
+# =========================================================
 def fetch_sync(url: str, timeout: int) -> Tuple[int, str]:
     try:
         r = SESSION.get(url, timeout=timeout)
@@ -224,21 +210,16 @@ async def validate_listing_by_details(url: str, max_price: int, min_year: int) -
     return True
 
 
-# =========================
+# =========================================================
 # Search URL builders
-# =========================
-
+# =========================================================
 def mobile_search_url(q: str, plz: str, radius: int, max_price: int) -> str:
-    """
-    mobile.de: wir nutzen eine einfache Such-URL.
-    Mindestjahr wird über Detailseiten-Validierung geprüft.
-    """
     base = "https://suchen.mobile.de/fahrzeuge/search.html"
     params = {
         "isSearchRequest": "true",
         "s": "Car",
-        "dam": "0",
         "vc": "Car",
+        "dam": "0",
         "sfmr": "1",
         "ref": "srp",
         "lang": "de",
@@ -252,16 +233,12 @@ def mobile_search_url(q: str, plz: str, radius: int, max_price: int) -> str:
 
 
 def kleinanzeigen_search_url(q: str, plz: str, radius: int, max_price: int) -> str:
-    """
-    Kleinanzeigen: Such-URL + Preisfilter.
-    Mindestjahr wird über Detailseiten-Validierung geprüft.
-    """
-    # Kleinanzeigen nutzt "k0l<plz>" nicht offiziell dokumentiert;
-    # wir nutzen location=<plz> und distance=<km>.
+    # kleinanzeigen ist zickig -> distance UND radius setzen
     base = "https://www.kleinanzeigen.de/s-autos/k0"
     params = {
         "keywords": q,
         "locationStr": plz,
+        "distance": str(radius),
         "radius": str(radius),
         "priceTo": str(max_price),
         "sortingField": "SORTING_DATE",
@@ -271,10 +248,9 @@ def kleinanzeigen_search_url(q: str, plz: str, radius: int, max_price: int) -> s
     return f"{base}?{qs}"
 
 
-# =========================
+# =========================================================
 # Extract listing URLs
-# =========================
-
+# =========================================================
 def extract_mobile_links(html: str) -> List[str]:
     soup = BeautifulSoup(html, "lxml")
     urls: List[str] = []
@@ -282,11 +258,17 @@ def extract_mobile_links(html: str) -> List[str]:
         href = a["href"]
         if not href:
             continue
-        # typische mobile detail urls:
-        # /fahrzeuge/details.html?id=...
+
+        # mobile detail links
         if "details.html?id=" in href or "/fahrzeuge/details.html" in href:
             u = urljoin("https://suchen.mobile.de", href)
             urls.append(normalize_url(u))
+
+        # manchmal kommen auch auto-inserat urls
+        if "mobile.de/auto-inserat/" in href:
+            u = urljoin("https://www.mobile.de", href)
+            urls.append(normalize_url(u))
+
     return dedupe_keep_order(urls)
 
 
@@ -297,20 +279,18 @@ def extract_kleinanzeigen_links(html: str) -> List[str]:
         href = a["href"]
         if not href:
             continue
-        # typische Anzeige-URLs enthalten /s-anzeige/
         if "/s-anzeige/" in href:
             u = urljoin("https://www.kleinanzeigen.de", href)
             urls.append(normalize_url(u))
     return dedupe_keep_order(urls)
 
 
-# =========================
+# =========================================================
 # Command parsing
-# =========================
-
+# =========================================================
 def parse_set(args: List[str]) -> Optional[Dict[str, Any]]:
     """
-    /set <query...> <PLZ> <UMKREIS_KM> <MAX_PREIS> <MIN_BJ>
+    /set <query...> <PLZ> <UMKREIS> <MAX_PREIS> <MIN_BJ>
     """
     if len(args) < 5:
         return None
@@ -335,7 +315,6 @@ def parse_set(args: List[str]) -> Optional[Dict[str, Any]]:
     if not q:
         return None
 
-    # clamp radius to sane values
     if radius < 1:
         radius = 1
     if radius > 500:
@@ -347,59 +326,52 @@ def parse_set(args: List[str]) -> Optional[Dict[str, Any]]:
         "radius": radius,
         "max_price": max_price,
         "min_year": min_year,
-        "created_at": time.time(),
         "active": True,
         "sources": ["mobile", "kleinanzeigen"],
+        "created_at": time.time(),
     }
 
 
-# =========================
+# =========================================================
 # Seen logic
-# =========================
-
-def should_send(seen_chat: Dict[str, float], url: str) -> bool:
-    return url not in seen_chat
-
-
-def mark_seen(seen_chat: Dict[str, float], url: str) -> None:
-    seen_chat[url] = time.time()
+# =========================================================
+def should_send(chat_seen: Dict[str, float], url: str) -> bool:
+    return url not in chat_seen
 
 
-# =========================
-# Telegram text helpers
-# =========================
+def mark_seen(chat_seen: Dict[str, float], url: str) -> None:
+    chat_seen[url] = time.time()
 
+
+# =========================================================
+# Telegram text
+# =========================================================
 def fmt_search(s: Dict[str, Any], idx: int) -> str:
     src = ",".join(s.get("sources", []))
     return (
-        f"*{idx}.* `{s.get('q','')}` | PLZ `{s.get('plz','')}` | "
-        f"Radius `{s.get('radius','')}`km | Max `{s.get('max_price','')}`€ | "
-        f"MinBJ `{s.get('min_year','')}` | Quellen `{src}` | "
+        f"*{idx}.* `{s.get('q','')}` | PLZ `{s.get('plz','')}` | Radius `{s.get('radius','')}`km | "
+        f"Max `{s.get('max_price','')}`€ | MinBJ `{s.get('min_year','')}` | Quellen `{src}` | "
         f"{'✅' if s.get('active') else '⛔'}"
     )
 
 
-# =========================
+# =========================================================
 # Telegram handlers
-# =========================
-
+# =========================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🛠️ AutoSuchBot läuft.\n\n"
         "Befehle:\n"
-        "/set <query...> <PLZ> <UMKREIS> <MAX_PREIS> <MIN_BJ>\n"
+        "/set <query...> <PLZ> <UMKREIS> <MAXPREIS> <MINBJ>\n"
         "/list\n"
         "/del <index>\n"
         "/stop\n"
-        "/status\n\n"
+        "/status\n"
+        "/run  (manueller Sofort-Check + Diagnose)\n\n"
         "Beispiel:\n"
         "`/set bmw 320 d touring 10115 50 12000 2013`",
         parse_mode=ParseMode.MARKDOWN,
     )
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await start(update, context)
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -409,13 +381,13 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     searches = state.get("chats", {}).get(chat_id, {}).get("searches", [])
     seen_count = len(seen.get("chats", {}).get(chat_id, {}))
-
     active_count = sum(1 for s in searches if s.get("active"))
+
     await update.message.reply_text(
         f"📌 Suchen: {len(searches)} (aktiv: {active_count})\n"
         f"👀 Gesehene Links: {seen_count}\n"
-        f"⏱️ Check-Intervall: {CHECK_INTERVAL_SECONDS}s\n"
-        f"📤 Max Links pro Run: {MAX_SEND_PER_RUN}"
+        f"⏱️ Intervall: {CHECK_INTERVAL_SECONDS}s\n"
+        f"📤 Max/Run: {MAX_SEND_PER_RUN}"
     )
 
 
@@ -435,14 +407,11 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = context.args or []
-    parsed = parse_set(args)
-
+    parsed = parse_set(context.args or [])
     if not parsed:
         await update.message.reply_text(
             "❌ Falsches Format.\n"
-            "Nutze:\n"
-            "/set <query...> <PLZ> <UMKREIS> <MAX_PREIS> <MIN_BJ>\n\n"
+            "/set <query...> <PLZ> <UMKREIS> <MAXPREIS> <MINBJ>\n\n"
             "Beispiel:\n"
             "`/set bmw 320 d touring 10115 50 12000 2013`",
             parse_mode=ParseMode.MARKDOWN,
@@ -470,7 +439,7 @@ async def del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         idx = int(args[0])
     except Exception:
-        await update.message.reply_text("❌ Index muss eine Zahl sein. (siehe /list)")
+        await update.message.reply_text("❌ Index muss Zahl sein. (siehe /list)")
         return
 
     state = load_state()
@@ -485,10 +454,7 @@ async def del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state["chats"][chat_id]["searches"] = searches
     save_state(state)
 
-    await update.message.reply_text(
-        "🗑️ Gelöscht:\n" + fmt_search(removed, idx),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await update.message.reply_text("🗑️ Gelöscht:\n" + fmt_search(removed, idx), parse_mode=ParseMode.MARKDOWN)
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -506,31 +472,31 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state["chats"][chat_id]["searches"] = searches
     save_state(state)
 
-    await update.message.reply_text("⛔ Alle Suchen für diesen Chat wurden deaktiviert.")
+    await update.message.reply_text("⛔ Alle Suchen in diesem Chat deaktiviert.")
 
 
-# =========================
-# Scheduled job
-# =========================
-
-async def run_checks_for_chat(chat_id: str, bot) -> None:
+# =========================================================
+# Core checking
+# =========================================================
+async def run_checks_for_chat(chat_id: str, bot, verbose: bool = False) -> str:
     state = load_state()
     seen = load_seen()
 
-    chat_state = state.get("chats", {}).get(chat_id, {})
-    searches: List[Dict[str, Any]] = chat_state.get("searches", [])
+    searches: List[Dict[str, Any]] = state.get("chats", {}).get(chat_id, {}).get("searches", [])
     if not searches:
-        return
+        return "ℹ️ Keine Suchen gesetzt."
+
+    active_searches = [s for s in searches if s.get("active")]
+    if not active_searches:
+        return "ℹ️ Keine aktiven Suchen."
 
     seen.setdefault("chats", {}).setdefault(chat_id, {})
     chat_seen: Dict[str, float] = seen["chats"][chat_id]
 
-    # nur aktive
-    active_searches = [s for s in searches if s.get("active")]
-    if not active_searches:
-        return
+    lines: List[str] = []
+    total_sent = 0
 
-    for s_idx, s in enumerate(active_searches):
+    for s in active_searches:
         q = s["q"]
         plz = s["plz"]
         radius = int(s["radius"])
@@ -539,36 +505,47 @@ async def run_checks_for_chat(chat_id: str, bot) -> None:
         sources = s.get("sources", ["mobile", "kleinanzeigen"])
 
         urls: List[str] = []
+        diag_parts: List[str] = []
 
         # mobile
         if "mobile" in sources:
             url = mobile_search_url(q=q, plz=plz, radius=radius, max_price=max_price)
             code, html = await fetch(url, timeout=LIST_TIMEOUT)
-            if code == 200 and html and not looks_like_blocked(html):
-                urls.extend(extract_mobile_links(html))
+            blocked = (code == 200 and html and looks_like_blocked(html))
+            extracted = extract_mobile_links(html) if (code == 200 and html and not blocked) else []
+            urls.extend(extracted)
+            diag_parts.append(f"mobile http={code} blocked={blocked} links={len(extracted)}")
 
         # kleinanzeigen
         if "kleinanzeigen" in sources:
             url = kleinanzeigen_search_url(q=q, plz=plz, radius=radius, max_price=max_price)
             code, html = await fetch(url, timeout=LIST_TIMEOUT)
-            if code == 200 and html and not looks_like_blocked(html):
-                urls.extend(extract_kleinanzeigen_links(html))
+            blocked = (code == 200 and html and looks_like_blocked(html))
+            extracted = extract_kleinanzeigen_links(html) if (code == 200 and html and not blocked) else []
+            urls.extend(extracted)
+            diag_parts.append(f"kleinanzeigen http={code} blocked={blocked} links={len(extracted)}")
 
         urls = dedupe_keep_order(urls)
 
+        checked = 0
+        passed = 0
         to_send: List[str] = []
+
         for u in urls:
             if not should_send(chat_seen, u):
                 continue
 
+            checked += 1
             ok = await validate_listing_by_details(u, max_price=max_price, min_year=min_year)
-            if not ok:
-                mark_seen(chat_seen, u)  # damit er nicht immer wieder den gleichen Müll prüft
-                continue
 
-            to_send.append(u)
+            # IMMER markieren (sonst hängt er an denselben Dingern für immer)
             mark_seen(chat_seen, u)
 
+            if not ok:
+                continue
+
+            passed += 1
+            to_send.append(u)
             if len(to_send) >= MAX_SEND_PER_RUN:
                 break
 
@@ -577,63 +554,69 @@ async def run_checks_for_chat(chat_id: str, bot) -> None:
                 f"🔎 *Neue Treffer* für: `{q}`\n"
                 f"PLZ `{plz}` | Radius `{radius}`km | Max `{max_price}`€ | MinBJ `{min_year}`\n\n"
             )
-            msg = header + "\n".join(to_send)
-            await bot.send_message(chat_id=int(chat_id), text=msg, parse_mode=ParseMode.MARKDOWN)
+            await bot.send_message(chat_id=int(chat_id), text=header + "\n".join(to_send), parse_mode=ParseMode.MARKDOWN)
+            total_sent += len(to_send)
 
-        # seen speichern nach jeder Suche
         save_seen(seen)
 
-        # kleine Pause zwischen Suchen, damit du nicht sofort geblockt wirst
+        if verbose:
+            lines.append(
+                f"🧾 `{q}` → urls={len(urls)} checked={checked} passed={passed} sent={len(to_send)}\n"
+                f"   " + " | ".join(diag_parts)
+            )
+
         await asyncio.sleep(1.0)
+
+    if verbose:
+        return "✅ Check fertig.\n\n" + ("\n\n".join(lines) if lines else "ℹ️ Kein Output.") + f"\n\n📤 Gesamt gesendet: {total_sent}"
+    return "ok"
 
 
 async def scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     bot = context.bot
     state = load_state()
+    chat_ids = list((state.get("chats") or {}).keys())
 
-    chats = list((state.get("chats") or {}).keys())
-    if not chats:
-        return
-
-    # nacheinander, stabiler (parallel kann dir block/429 bringen)
-    for chat_id in chats:
+    for chat_id in chat_ids:
         try:
-            await run_checks_for_chat(chat_id, bot)
+            await run_checks_for_chat(chat_id, bot, verbose=False)
         except Exception as e:
-            # niemals crashen wegen einem Chat
             print(f"[scheduled_job] chat {chat_id} error: {e}")
 
 
-# =========================
-# Entrypoint
-# =========================
+async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = str(update.effective_chat.id)
+    await update.message.reply_text("🔧 Starte manuellen Check…")
+    diag = await run_checks_for_chat(chat_id, context.bot, verbose=True)
+    await update.message.reply_text(diag)
 
+
+# =========================================================
+# Entrypoint
+# =========================================================
 def main() -> None:
     ensure_data_dir()
 
     if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN fehlt in ENV (Railway Variables).")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN fehlt (Railway Variables).")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("set", set_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("del", del_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CommandHandler("run", run_cmd))
 
-    # Scheduler starten (crash-sicher)
+    # Scheduler (wenn JobQueue vorhanden)
     if app.job_queue is None:
-        print("⚠️ JobQueue fehlt – installiere python-telegram-bot[job-queue]. Starte ohne Scheduler.")
+        print("⚠️ JobQueue fehlt. Installiere python-telegram-bot[job-queue]. Scheduler aus.")
     else:
-        app.job_queue.run_repeating(
-            scheduled_job,
-            interval=CHECK_INTERVAL_SECONDS,
-            first=5,
-        )
+        app.job_queue.run_repeating(scheduled_job, interval=CHECK_INTERVAL_SECONDS, first=8)
 
+    print("✅ Bot startet polling…")
     app.run_polling()
 
 
