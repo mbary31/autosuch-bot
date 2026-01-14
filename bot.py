@@ -447,7 +447,11 @@ def main():
     app.add_handler(CommandHandler("del", del_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
 
+    if app.job_queue is None:
+    print("⚠️ JobQueue fehlt – installiere python-telegram-bot[job-queue]. Starte ohne Scheduler.")
+else:
     app.job_queue.run_repeating(scheduled_job, interval=CHECK_INTERVAL_SECONDS, first=5)
+
     app.run_polling()
 
 if __name__ == "__main__":
