@@ -6,17 +6,14 @@ import hashlib
 import logging
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ---------------------------
 # CONFIG
@@ -30,6 +27,9 @@ CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))  # every
 MAX_RESULTS_PER_CHECK = int(os.getenv("MAX_RESULTS_PER_CHECK", "10"))    # limit per run
 RESEND_AFTER_SECONDS = int(os.getenv("RESEND_AFTER_SECONDS", str(2 * 60 * 60)))  # 2h
 
+# If min_year is set, we require a real year from detail page (no guessing)
+REQUIRE_TRUSTED_YEAR = True
+
 # blacklist words (auto-K.O.)
 BLACKLIST = {
     "unfall",
@@ -41,19 +41,14 @@ BLACKLIST = {
     "teiletraeger",
     "ohne tüv",
     "ohne tuv",
-    "ohne tüv!",
-    "ohne tuv!",
 }
 
-# "must have images" filter
 REQUIRE_IMAGES = True
 
-# storage
 DATA_DIR = os.getenv("DATA_DIR", ".")
 SEARCHES_FILE = os.path.join(DATA_DIR, "searches.json")
 SENT_FILE = os.path.join(DATA_DIR, "sent_cache.json")
 
-# user-agent (important for scraping)
 UA = os.getenv(
     "SCRAPE_UA",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -65,7 +60,7 @@ log = logging.getLogger("autosuch-bot")
 
 
 # ---------------------------
-# DATA MODELS
+# DATA
 # ---------------------------
 
 @dataclass
@@ -79,17 +74,13 @@ class Search:
 
     @property
     def query(self) -> str:
-        # for searching
         return f"{self.make} {self.model}".strip()
 
     @property
     def key(self) -> str:
-        # unique identifier for this search
         return f"{self.make.lower()}|{self.model.lower()}|{self.plz}|{self.radius_km}|{self.max_price}|{self.min_year}"
 
 
-# sent cache structure:
-# sent_cache[chat_id][listing_id] = {"ts": last_sent_ts, "hash": content_hash}
 SentCache = Dict[str, Dict[str, Dict[str, str]]]
 SearchStore = Dict[str, List[Dict]]
 
@@ -128,210 +119,16 @@ def contains_blacklist(text: str) -> Optional[str]:
     return None
 
 
-def extract_year(text: str) -> Optional[int]:
-    # tries to find a plausible year in text
-    if not text:
-        return None
-    years = re.findall(r"\b(19[5-9]\d|20[0-2]\d)\b", text)
-    if not years:
-        return None
-    # choose the first plausible year
-    try:
-        return int(years[0])
-    except:
-        return None
-
-
-def hash_listing(title: str, price: str, location: str, extra: str = "") -> str:
-    h = hashlib.sha256()
-    h.update((title or "").encode("utf-8"))
-    h.update(b"|")
-    h.update((price or "").encode("utf-8"))
-    h.update(b"|")
-    h.update((location or "").encode("utf-8"))
-    h.update(b"|")
-    h.update((extra or "").encode("utf-8"))
-    return h.hexdigest()
-
-
 def now_ts() -> int:
     return int(time.time())
 
 
-# ---------------------------
-# URL BUILDERS
-# ---------------------------
-
-def kleinanzeigen_search_url(s: Search) -> str:
-    # Important: do NOT prefix with "auto," or "autos," -> keywords must be only query
-    # We'll use a safe querystring-based URL.
-    #
-    # NOTE: Kleinanzeigen URL formats vary; this one works widely:
-    # /s-autos/k0c216?keywords=...&locationStr=...&radius=...&priceTo=...
-    from urllib.parse import urlencode
-
-    params = {
-        "keywords": s.query,           # only query, nothing else!
-        "locationStr": s.plz,
-        "radius": str(s.radius_km),
-        "priceTo": str(s.max_price),
-        "sortierung": "date",          # newest first (best effort)
-    }
-    return "https://www.kleinanzeigen.de/s-autos/k0c216?" + urlencode(params)
-
-
-def mobile_search_url(s: Search) -> str:
-    # mobile.de URL: we’ll use fulltext query BUT we also filter strictly in code
-    # so the bot only alerts true matches.
-    from urllib.parse import urlencode
-
-    params = {
-        "isSearchRequest": "true",
-        "q": s.query,                 # query string
-        "maxPrice": str(s.max_price),
-        "radius": str(s.radius_km),
-        "zip": s.plz,
-        "dam": "0",                   # no accident-damaged filter parameter used here
-        "sb": "rel",                  # relevance
-        "vc": "Car",
-        "cn": "DE",
-    }
-    return "https://suchen.mobile.de/fahrzeuge/search.html?" + urlencode(params)
-
-
-# ---------------------------
-# SCRAPERS
-# ---------------------------
-
-session = requests.Session()
-session.headers.update({"User-Agent": UA, "Accept-Language": "de-DE,de;q=0.9,en;q=0.8"})
-
-
-def scrape_kleinanzeigen(s: Search) -> List[Dict]:
-    url = kleinanzeigen_search_url(s)
-    r = session.get(url, timeout=25)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
-
-    results = []
-    # Kleinanzeigen listings usually have links containing "/s-anzeige/"
-    for a in soup.select("a[href*='/s-anzeige/']"):
-        href = a.get("href") or ""
-        if not href.startswith("http"):
-            href = "https://www.kleinanzeigen.de" + href
-
-        # find container for more info
-        card = a
-        for _ in range(4):
-            if card and card.name != "article":
-                card = card.parent
-            else:
-                break
-
-        title = a.get_text(" ", strip=True)
-        if not title or len(title) < 3:
-            continue
-
-        # best-effort: locate price & location text near the link
-        card_text = card.get_text(" ", strip=True) if card else ""
-        price = ""
-        m_price = re.search(r"(\d[\d\.\s]*)(\s?€)", card_text)
-        if m_price:
-            price = (m_price.group(1).replace(".", "").replace(" ", "") + " €").strip()
-
-        location = ""
-        # often something like "67157 Wachenheim"
-        m_loc = re.search(r"\b(\d{5})\b\s+([A-Za-zÄÖÜäöüß\- ]{2,})", card_text)
-        if m_loc:
-            location = f"{m_loc.group(1)} {m_loc.group(2).strip()}"
-
-        # image check (best effort)
-        has_img = False
-        if REQUIRE_IMAGES and card:
-            has_img = bool(card.select_one("img"))
-        else:
-            has_img = True
-
-        results.append({
-            "source": "kleinanzeigen",
-            "id": href,   # stable enough
-            "title": title,
-            "url": href,
-            "price_text": price,
-            "location_text": location,
-            "raw_text": card_text,
-            "has_img": has_img,
-        })
-
-    return results
-
-
-def scrape_mobile(s: Search) -> List[Dict]:
-    url = mobile_search_url(s)
-    r = session.get(url, timeout=25)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
-
-    results = []
-    # mobile results typically have anchors to "/auto-inserat/"
-    for a in soup.select("a[href*='/auto-inserat/']"):
-        href = a.get("href") or ""
-        if not href:
-            continue
-        if href.startswith("/"):
-            href = "https://suchen.mobile.de" + href
-        if "mobile.de" not in href:
-            continue
-
-        # find card container (best effort)
-        card = a
-        for _ in range(6):
-            if card and card.name not in ("article", "li", "div"):
-                card = card.parent
-            else:
-                break
-
-        title = a.get_text(" ", strip=True)
-        if not title:
-            continue
-
-        card_text = card.get_text(" ", strip=True) if card else ""
-
-        # extract price
-        price = ""
-        m_price = re.search(r"(\d[\d\.\s]*)\s?€", card_text)
-        if m_price:
-            price = (m_price.group(1).replace(".", "").replace(" ", "") + " €").strip()
-
-        # image check
-        has_img = False
-        if REQUIRE_IMAGES and card:
-            has_img = bool(card.select_one("img"))
-        else:
-            has_img = True
-
-        results.append({
-            "source": "mobile",
-            "id": href,
-            "title": title,
-            "url": href,
-            "price_text": price,
-            "location_text": "",
-            "raw_text": card_text,
-            "has_img": has_img,
-        })
-
-    return results
-
-
-# ---------------------------
-# FILTERING
-# ---------------------------
-
-def parse_price_eur(price_text: str) -> Optional[int]:
-    if not price_text:
+def parse_price_eur(text: str) -> Optional[int]:
+    if not text:
         return None
-    m = re.search(r"(\d[\d\.\s]*)", price_text)
+    m = re.search(r"(\d[\d\.\s]*)\s?€", text)
+    if not m:
+        m = re.search(r"(\d[\d\.\s]*)", text)
     if not m:
         return None
     try:
@@ -340,10 +137,266 @@ def parse_price_eur(price_text: str) -> Optional[int]:
         return None
 
 
+def pick_year_from_text(text: str) -> Optional[int]:
+    # trusted-ish year extraction: must be 1950-2029
+    if not text:
+        return None
+    m = re.search(r"\b(19[5-9]\d|20[0-2]\d)\b", text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except:
+        return None
+
+
+def hash_listing(title: str, price: str, location: str, year: str, extra: str = "") -> str:
+    h = hashlib.sha256()
+    h.update((title or "").encode("utf-8"))
+    h.update(b"|")
+    h.update((price or "").encode("utf-8"))
+    h.update(b"|")
+    h.update((location or "").encode("utf-8"))
+    h.update(b"|")
+    h.update((year or "").encode("utf-8"))
+    h.update(b"|")
+    h.update((extra or "").encode("utf-8"))
+    return h.hexdigest()
+
+
+# ---------------------------
+# HTTP
+# ---------------------------
+
+session = requests.Session()
+session.headers.update({
+    "User-Agent": UA,
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8"
+})
+
+
+def get_html(url: str) -> str:
+    r = session.get(url, timeout=30)
+    r.raise_for_status()
+    return r.text
+
+
+# ---------------------------
+# URL BUILDERS
+# ---------------------------
+
+def kleinanzeigen_search_url(s: Search) -> str:
+    # IMPORTANT: no "autos," prefix. Only the actual query.
+    params = {
+        "keywords": s.query,
+        "locationStr": s.plz,
+        "radius": str(s.radius_km),
+        "priceTo": str(s.max_price),
+        "sortierung": "date",
+    }
+    return "https://www.kleinanzeigen.de/s-autos/k0c216?" + urlencode(params)
+
+
+def mobile_search_url(s: Search) -> str:
+    params = {
+        "isSearchRequest": "true",
+        "q": s.query,
+        "maxPrice": str(s.max_price),
+        "radius": str(s.radius_km),
+        "zip": s.plz,
+        "vc": "Car",
+        "cn": "DE",
+    }
+    return "https://suchen.mobile.de/fahrzeuge/search.html?" + urlencode(params)
+
+
+# ---------------------------
+# DETAIL PARSERS (trusted year/price)
+# ---------------------------
+
+def kleinanzeigen_detail(url: str) -> Dict:
+    html = get_html(url)
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(" ", strip=True)
+
+    # title
+    title = ""
+    h1 = soup.select_one("h1")
+    if h1:
+        title = h1.get_text(" ", strip=True)
+
+    # price
+    price_text = ""
+    p = soup.select_one("[id='viewad-price'], .boxedarticle--price")
+    if p:
+        price_text = p.get_text(" ", strip=True)
+
+    # location
+    location_text = ""
+    loc = soup.select_one("#viewad-locality, .boxedarticle--details--full")
+    if loc:
+        location_text = loc.get_text(" ", strip=True)
+
+    # year: Kleinanzeigen often has "Baujahr" in attributes
+    year = None
+    # try structured attribute rows
+    for row in soup.select(".addetailslist--detail, .aditem-main--middle--description"):
+        t = row.get_text(" ", strip=True)
+        if "Baujahr" in t:
+            y = pick_year_from_text(t)
+            if y:
+                year = y
+                break
+    if not year:
+        # fallback: scan whole page for "Baujahr"
+        m = re.search(r"Baujahr\s*[:\-]?\s*(19[5-9]\d|20[0-2]\d)", text)
+        if m:
+            year = int(m.group(1))
+
+    # images
+    has_img = bool(soup.select_one("img"))  # best effort
+
+    return {
+        "title": title,
+        "price_text": price_text,
+        "location_text": location_text,
+        "year": year,
+        "has_img": has_img,
+        "raw_text": text[:2000],
+    }
+
+
+def mobile_detail(url: str) -> Dict:
+    html = get_html(url)
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(" ", strip=True)
+
+    # title
+    title = ""
+    h1 = soup.select_one("h1")
+    if h1:
+        title = h1.get_text(" ", strip=True)
+
+    # price: mobile has lots of variants
+    price_text = ""
+    # try common price containers
+    for sel in [
+        "[data-testid='prime-price']",
+        ".price-block__price",
+        ".vehicle-prices__price",
+        ".vip-price",
+        ".g-col-6 .h3",  # fallback-ish
+    ]:
+        el = soup.select_one(sel)
+        if el:
+            price_text = el.get_text(" ", strip=True)
+            if "€" in price_text or parse_price_eur(price_text) is not None:
+                break
+
+    # year: usually "Erstzulassung" or "Baujahr"
+    year = None
+    m = re.search(r"(Erstzulassung|Baujahr)\s*[:\-]?\s*(19[5-9]\d|20[0-2]\d)", text)
+    if m:
+        year = int(m.group(2))
+
+    # images
+    has_img = bool(soup.select_one("img"))
+
+    return {
+        "title": title,
+        "price_text": price_text,
+        "location_text": "",
+        "year": year,
+        "has_img": has_img,
+        "raw_text": text[:2000],
+    }
+
+
+# ---------------------------
+# SEARCH SCRAPERS (collect URLs)
+# ---------------------------
+
+def scrape_kleinanzeigen_urls(s: Search) -> List[Dict]:
+    url = kleinanzeigen_search_url(s)
+    soup = BeautifulSoup(get_html(url), "lxml")
+    out = []
+    for a in soup.select("a[href*='/s-anzeige/']"):
+        href = a.get("href") or ""
+        if not href:
+            continue
+        if not href.startswith("http"):
+            href = urljoin("https://www.kleinanzeigen.de", href)
+
+        out.append({
+            "source": "kleinanzeigen",
+            "id": href,
+            "url": href,
+        })
+    # de-dupe while keeping order
+    seen = set()
+    uniq = []
+    for x in out:
+        if x["id"] in seen:
+            continue
+        seen.add(x["id"])
+        uniq.append(x)
+    return uniq
+
+
+def scrape_mobile_urls(s: Search) -> List[Dict]:
+    url = mobile_search_url(s)
+    soup = BeautifulSoup(get_html(url), "lxml")
+
+    candidates = []
+
+    # multiple selectors (mobile changes a lot)
+    selectors = [
+        "a[href*='/auto-inserat/']",
+        "a[data-testid='result-title']",
+        "a[data-testid='vehicle-result-link']",
+        "a[href*='link.mobile.de/']",
+        "a[href*='www.mobile.de/']",
+    ]
+
+    for sel in selectors:
+        for a in soup.select(sel):
+            href = a.get("href") or ""
+            if not href:
+                continue
+            if href.startswith("/"):
+                href = urljoin("https://suchen.mobile.de", href)
+
+            host = urlparse(href).netloc.lower()
+            if ("mobile.de" not in host) and ("link.mobile.de" not in host):
+                continue
+
+            # only keep real car listings if possible
+            if "/auto-inserat/" not in href and "link.mobile.de" not in host:
+                continue
+
+            candidates.append(href)
+
+    # de-dupe while keeping order
+    seen = set()
+    uniq = []
+    for href in candidates:
+        if href in seen:
+            continue
+        seen.add(href)
+        uniq.append({
+            "source": "mobile",
+            "id": href,
+            "url": href,
+        })
+    return uniq
+
+
+# ---------------------------
+# FILTERS
+# ---------------------------
+
 def strict_match_make_model(s: Search, title: str, raw: str) -> bool:
-    # Make sure mobile doesn’t spam all Audis:
-    # require both make and model to appear in title or snippet.
-    t = norm(title + " " + raw)
+    t = norm((title or "") + " " + (raw or ""))
     return (norm(s.make) in t) and (norm(s.model) in t)
 
 
@@ -351,35 +404,35 @@ def passes_filters(s: Search, item: Dict) -> Tuple[bool, str]:
     title = item.get("title", "")
     raw = item.get("raw_text", "")
 
-    # strict make/model match (especially for mobile)
+    # strict make/model on mobile (stops “all Audis”)
     if item.get("source") == "mobile":
         if not strict_match_make_model(s, title, raw):
             return False, "no_strict_make_model"
 
-    # blacklist
     bad = contains_blacklist(title + " " + raw)
     if bad:
         return False, f"blacklist:{bad}"
 
-    # images
     if REQUIRE_IMAGES and not item.get("has_img", False):
         return False, "no_image"
 
-    # price
     p = parse_price_eur(item.get("price_text", ""))
     if p is not None and p > s.max_price:
         return False, "over_price"
 
-    # year (best effort)
-    y = extract_year(title + " " + raw)
-    if y is not None and y < s.min_year:
-        return False, "year_too_old"
+    y = item.get("year")
+    if s.min_year and REQUIRE_TRUSTED_YEAR:
+        # If we require trusted year and we can't find one -> ignore (no wrong years)
+        if y is None:
+            return False, "no_trusted_year"
+        if y < s.min_year:
+            return False, "year_too_old"
 
     return True, "ok"
 
 
 # ---------------------------
-# SENDING / DEDUP
+# DEDUP / SEND
 # ---------------------------
 
 def should_send(chat_id: str, item: Dict, sent_cache: SentCache) -> bool:
@@ -387,13 +440,12 @@ def should_send(chat_id: str, item: Dict, sent_cache: SentCache) -> bool:
     title = item.get("title", "")
     price = item.get("price_text", "")
     loc = item.get("location_text", "")
-    raw = item.get("raw_text", "")
+    year = str(item.get("year") or "")
 
-    content_hash = hash_listing(title, price, loc, raw[:400])
+    content_hash = hash_listing(title, price, loc, year, item.get("raw_text", "")[:400])
 
     sent_cache.setdefault(chat_id, {})
     prev = sent_cache[chat_id].get(listing_id)
-
     ts = now_ts()
 
     if not prev:
@@ -413,25 +465,28 @@ def should_send(chat_id: str, item: Dict, sent_cache: SentCache) -> bool:
     return False
 
 
-def format_alert(s: Search, item: Dict) -> str:
+def format_alert(item: Dict) -> str:
     src = item.get("source", "")
-    title = item.get("title", "").strip()
-    price = item.get("price_text", "").strip()
-    loc = item.get("location_text", "").strip()
-    url = item.get("url", "").strip()
+    title = (item.get("title") or "").strip()
+    price = (item.get("price_text") or "").strip()
+    loc = (item.get("location_text") or "").strip()
+    year = item.get("year")
+    url = (item.get("url") or "").strip()
 
-    parts = [f"🚗 *{title}*"]
     meta = []
+    if year:
+        meta.append(f"📆 BJ {year}")
     if price:
         meta.append(f"💶 {price}")
     if loc:
         meta.append(f"📍 {loc}")
     meta.append(f"🔎 {src}")
 
-    parts.append(" | ".join(meta))
-    parts.append(f"🔗 {url}")
-
-    return "\n".join(parts)
+    return "\n".join([
+        f"🚗 *{title}*",
+        " | ".join(meta),
+        f"🔗 {url}",
+    ])
 
 
 # ---------------------------
@@ -439,19 +494,17 @@ def format_alert(s: Search, item: Dict) -> str:
 # ---------------------------
 
 def parse_set_args(text: str) -> Search:
-    # Expected:
     # /set Auto Model PLZ Umkreis Preis BJ
-    #
-    # Example:
-    # /set audi a6 67157 300 10000 2010
     parts = text.strip().split()
     if len(parts) < 7:
         raise ValueError("Format: /set Auto Model PLZ Umkreis Preis BJ (z.B. /set audi a6 67157 300 10000 2010)")
 
-    # parts[0] is /set
     make = parts[1]
     model = parts[2]
     plz = parts[3]
+
+    if not re.fullmatch(r"\d{5}", plz):
+        raise ValueError("PLZ muss 5-stellig sein (z.B. 67157).")
 
     try:
         radius = int(re.sub(r"\D", "", parts[4]))
@@ -459,9 +512,6 @@ def parse_set_args(text: str) -> Search:
         min_year = int(re.sub(r"\D", "", parts[6]))
     except:
         raise ValueError("Umkreis/Preis/BJ müssen Zahlen sein. Beispiel: /set audi a6 67157 300 10000 2010")
-
-    if not re.fullmatch(r"\d{5}", plz):
-        raise ValueError("PLZ muss 5-stellig sein (z.B. 67157).")
 
     return Search(make=make, model=model, plz=plz, radius_km=radius, max_price=max_price, min_year=min_year)
 
@@ -476,7 +526,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Andere:*\n"
         "`/list`  – gespeicherte Suchen\n"
         "`/del <nr>` – Suche löschen\n"
-        "`/stop`  – alle Suchen löschen\n"
+        "`/stop`  – alles löschen\n"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -489,20 +539,19 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ {e}")
         return
 
-    store: SearchStore = load_json(SEARCHES_FILE, {})
+    store: SearchStore = load_json("searches.json", {})
     store.setdefault(chat_id, [])
     store[chat_id].append(asdict(s))
-    save_json(SEARCHES_FILE, store)
+    save_json("searches.json", store)
 
-    # confirm + show search links
     ka = kleinanzeigen_search_url(s)
     mo = mobile_search_url(s)
 
     await update.message.reply_text(
         "✅ *Suche gespeichert!*\n"
         f"🚗 `{s.make} {s.model}`\n"
-        f"💶 bis `{s.max_price}€`\n"
         f"📍 PLZ `{s.plz}` + `{s.radius_km} km`\n"
+        f"💶 bis `{s.max_price}€`\n"
         f"📆 ab BJ `{s.min_year}`\n\n"
         f"🔎 *Kleinanzeigen Suche:*\n{ka}\n\n"
         f"🔎 *mobile.de Suche:*\n{mo}\n\n"
@@ -513,9 +562,8 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    store: SearchStore = load_json(SEARCHES_FILE, {})
+    store: SearchStore = load_json("searches.json", {})
     items = store.get(chat_id, [])
-
     if not items:
         await update.message.reply_text("Keine gespeicherten Suchen.")
         return
@@ -531,9 +579,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    store: SearchStore = load_json(SEARCHES_FILE, {})
+    store: SearchStore = load_json("searches.json", {})
     items = store.get(chat_id, [])
-
     if not items:
         await update.message.reply_text("Keine gespeicherten Suchen.")
         return
@@ -550,7 +597,7 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     removed = items.pop(idx)
     store[chat_id] = items
-    save_json(SEARCHES_FILE, store)
+    save_json("searches.json", store)
 
     s = Search(**removed)
     await update.message.reply_text(f"🗑️ Gelöscht: {s.make} {s.model} ({s.plz})")
@@ -558,27 +605,24 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    store: SearchStore = load_json(SEARCHES_FILE, {})
-    if chat_id in store:
-        store.pop(chat_id, None)
-        save_json(SEARCHES_FILE, store)
+    store: SearchStore = load_json("searches.json", {})
+    store.pop(chat_id, None)
+    save_json("searches.json", store)
 
-    # also clear cache for this chat
-    sent: SentCache = load_json(SENT_FILE, {})
-    if chat_id in sent:
-        sent.pop(chat_id, None)
-        save_json(SENT_FILE, sent)
+    sent: SentCache = load_json("sent_cache.json", {})
+    sent.pop(chat_id, None)
+    save_json("sent_cache.json", sent)
 
     await update.message.reply_text("🛑 Alles gelöscht. Keine Alerts mehr.")
 
 
 # ---------------------------
-# JOB LOOP
+# CHECK LOOP
 # ---------------------------
 
 async def check_once(app: Application):
-    store: SearchStore = load_json(SEARCHES_FILE, {})
-    sent: SentCache = load_json(SENT_FILE, {})
+    store: SearchStore = load_json("searches.json", {})
+    sent: SentCache = load_json("sent_cache.json", {})
 
     for chat_id, searches in store.items():
         compiled: List[Search] = []
@@ -587,34 +631,48 @@ async def check_once(app: Application):
                 compiled.append(Search(**d))
             except:
                 continue
-
         if not compiled:
             continue
 
         for s in compiled:
-            # scrape both sources
-            all_items: List[Dict] = []
+            # collect URLs
+            items = []
             try:
-                all_items += scrape_kleinanzeigen(s)
+                items += scrape_kleinanzeigen_urls(s)
             except Exception as e:
-                log.warning("Kleinanzeigen scrape failed: %s", e)
+                log.warning("Kleinanzeigen URL scrape failed: %s", e)
 
             try:
-                all_items += scrape_mobile(s)
+                items += scrape_mobile_urls(s)
             except Exception as e:
-                log.warning("mobile scrape failed: %s", e)
+                log.warning("mobile URL scrape failed: %s", e)
 
-            # filter + send
             sent_count = 0
-            for item in all_items:
-                ok, reason = passes_filters(s, item)
+
+            # enrich + filter + send (limit requests)
+            for base in items[:200]:
+                src = base["source"]
+                url = base["url"]
+
+                try:
+                    if src == "kleinanzeigen":
+                        details = kleinanzeigen_detail(url)
+                    else:
+                        details = mobile_detail(url)
+                except Exception as e:
+                    log.warning("detail fetch failed (%s): %s", src, e)
+                    continue
+
+                item = {**base, **details}
+
+                ok, _reason = passes_filters(s, item)
                 if not ok:
                     continue
 
                 if not should_send(chat_id, item, sent):
                     continue
 
-                text = format_alert(s, item)
+                text = format_alert(item)
                 try:
                     await app.bot.send_message(
                         chat_id=int(chat_id),
@@ -629,7 +687,7 @@ async def check_once(app: Application):
                 if sent_count >= MAX_RESULTS_PER_CHECK:
                     break
 
-    save_json(SENT_FILE, sent)
+    save_json("sent_cache.json", sent)
 
 
 async def job_runner(context: ContextTypes.DEFAULT_TYPE):
@@ -645,9 +703,7 @@ def main():
     app.add_handler(CommandHandler("del", cmd_del))
     app.add_handler(CommandHandler("stop", cmd_stop))
 
-    # job queue every minute
     app.job_queue.run_repeating(job_runner, interval=CHECK_INTERVAL_SECONDS, first=5)
-
     log.info("Bot started.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
