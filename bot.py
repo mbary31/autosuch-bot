@@ -3,710 +3,677 @@ import re
 import json
 import time
 import hashlib
-import logging
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import urlencode, quote_plus, urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
-# ---------------------------
+# =========================
 # CONFIG
-# ---------------------------
+# =========================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-if not TELEGRAM_BOT_TOKEN:
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
     raise RuntimeError("Missing env var TELEGRAM_BOT_TOKEN")
 
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))  # every minute
-MAX_RESULTS_PER_CHECK = int(os.getenv("MAX_RESULTS_PER_CHECK", "10"))    # limit per run
-RESEND_AFTER_SECONDS = int(os.getenv("RESEND_AFTER_SECONDS", str(2 * 60 * 60)))  # 2h
+CHECK_INTERVAL_SECONDS = 60  # jede Minute
 
-# If min_year is set, we require a real year from detail page (no guessing)
-REQUIRE_TRUSTED_YEAR = True
+DATA_DIR = "./data"
+SEARCHES_FILE = os.path.join(DATA_DIR, "searches.json")
+SEEN_FILE = os.path.join(DATA_DIR, "seen.json")
 
-# blacklist words (auto-K.O.)
-BLACKLIST = {
+# Wenn Anzeige schon geschickt wurde:
+RESEND_AFTER_SECONDS = 2 * 60 * 60  # 2h
+
+# Blacklist (Punkt 3) – kannst du hier fix ändern
+DEFAULT_BLACKLIST = [
     "unfall",
     "bastler",
     "motorschaden",
     "defekt",
     "export",
     "teileträger",
-    "teiletraeger",
     "ohne tüv",
-    "ohne tuv",
-}
+    "ohne tüv!",
+    "ohne tüv.",
+]
 
-REQUIRE_IMAGES = True
+# Nur mit Bildern (Punkt 1)
+REQUIRE_PICTURES = True
 
-DATA_DIR = os.getenv("DATA_DIR", ".")
-SEARCHES_FILE = os.path.join(DATA_DIR, "searches.json")
-SENT_FILE = os.path.join(DATA_DIR, "sent_cache.json")
-
-UA = os.getenv(
-    "SCRAPE_UA",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-)
-
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("autosuch-bot")
-
-
-# ---------------------------
-# DATA
-# ---------------------------
+# =========================
+# DATA MODELS
+# =========================
 
 @dataclass
-class Search:
+class SearchConfig:
     make: str
     model: str
     plz: str
     radius_km: int
-    max_price: int
+    max_price_eur: int
     min_year: int
+    created_at: float
 
-    @property
-    def query(self) -> str:
+    def query_text(self) -> str:
+        # Wichtig: KEIN "auto," davor – nur Marke+Modell
         return f"{self.make} {self.model}".strip()
 
-    @property
-    def key(self) -> str:
-        return f"{self.make.lower()}|{self.model.lower()}|{self.plz}|{self.radius_km}|{self.max_price}|{self.min_year}"
+
+@dataclass
+class Listing:
+    site: str                # "kleinanzeigen" | "mobile"
+    listing_id: str
+    title: str
+    price_eur: Optional[int]
+    year: Optional[int]
+    location: str
+    url: str
+    has_pictures: Optional[bool] = None
+
+    def fingerprint(self) -> str:
+        # Wenn sich Preis/Titel/Ort/Jahr ändert -> anderer Fingerprint -> erneut senden
+        base = f"{self.title}|{self.price_eur}|{self.year}|{self.location}"
+        return hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()
 
 
-SentCache = Dict[str, Dict[str, Dict[str, str]]]
-SearchStore = Dict[str, List[Dict]]
+# =========================
+# STORAGE HELPERS
+# =========================
 
-
-# ---------------------------
-# UTIL
-# ---------------------------
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
 
 def load_json(path: str, default):
     try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        log.warning("Failed to load %s: %s", path, e)
-    return default
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-
-def save_json(path: str, data) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+def save_json(path: str, data):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
+def load_searches() -> Dict[str, List[SearchConfig]]:
+    raw = load_json(SEARCHES_FILE, {})
+    out: Dict[str, List[SearchConfig]] = {}
+    for chat_id, items in raw.items():
+        out[chat_id] = [SearchConfig(**x) for x in items]
+    return out
 
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
+def save_searches(searches: Dict[str, List[SearchConfig]]):
+    raw = {cid: [asdict(s) for s in lst] for cid, lst in searches.items()}
+    save_json(SEARCHES_FILE, raw)
 
+def load_seen() -> Dict[str, Dict[str, dict]]:
+    # seen[chat_id][site:listing_id] = { "last_sent": ts, "fingerprint": fp }
+    return load_json(SEEN_FILE, {})
 
-def contains_blacklist(text: str) -> Optional[str]:
-    t = norm(text)
-    for w in BLACKLIST:
-        if w in t:
-            return w
-    return None
-
-
-def now_ts() -> int:
-    return int(time.time())
-
-
-def parse_price_eur(text: str) -> Optional[int]:
-    if not text:
-        return None
-    m = re.search(r"(\d[\d\.\s]*)\s?€", text)
-    if not m:
-        m = re.search(r"(\d[\d\.\s]*)", text)
-    if not m:
-        return None
-    try:
-        return int(m.group(1).replace(".", "").replace(" ", ""))
-    except:
-        return None
+def save_seen(seen: Dict[str, Dict[str, dict]]):
+    save_json(SEEN_FILE, seen)
 
 
-def pick_year_from_text(text: str) -> Optional[int]:
-    # trusted-ish year extraction: must be 1950-2029
-    if not text:
-        return None
-    m = re.search(r"\b(19[5-9]\d|20[0-2]\d)\b", text)
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except:
-        return None
-
-
-def hash_listing(title: str, price: str, location: str, year: str, extra: str = "") -> str:
-    h = hashlib.sha256()
-    h.update((title or "").encode("utf-8"))
-    h.update(b"|")
-    h.update((price or "").encode("utf-8"))
-    h.update(b"|")
-    h.update((location or "").encode("utf-8"))
-    h.update(b"|")
-    h.update((year or "").encode("utf-8"))
-    h.update(b"|")
-    h.update((extra or "").encode("utf-8"))
-    return h.hexdigest()
-
-
-# ---------------------------
+# =========================
 # HTTP
-# ---------------------------
+# =========================
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": UA,
-    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8"
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
 })
 
-
-def get_html(url: str) -> str:
-    r = session.get(url, timeout=30)
+def fetch(url: str, timeout: int = 20) -> str:
+    r = SESSION.get(url, timeout=timeout)
     r.raise_for_status()
     return r.text
 
 
-# ---------------------------
-# URL BUILDERS
-# ---------------------------
+# =========================
+# PARSING HELPERS
+# =========================
 
-def kleinanzeigen_search_url(s: Search) -> str:
-    # IMPORTANT: no "autos," prefix. Only the actual query.
+def parse_price_eur(text: str) -> Optional[int]:
+    if not text:
+        return None
+    t = text.strip().lower()
+    if "vb" in t:
+        # VB trotzdem Zahl holen
+        pass
+    # 10.000 € / 10000€ / 10 000 €
+    nums = re.findall(r"(\d[\d\.\s]*)", t)
+    if not nums:
+        return None
+    n = nums[0]
+    n = n.replace(".", "").replace(" ", "")
+    try:
+        return int(n)
+    except:
+        return None
+
+def contains_blacklist(title: str, blacklist: List[str]) -> bool:
+    t = (title or "").lower()
+    return any(w in t for w in blacklist)
+
+def normalize_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+# =========================
+# KLEINANZEIGEN
+# =========================
+
+def build_kleinanzeigen_search_url(q: str, plz: str, radius_km: int, max_price: int) -> str:
+    # Autos Kategorie ist k0c216 (wie du schon gesehen hast)
     params = {
-        "keywords": s.query,
-        "locationStr": s.plz,
-        "radius": str(s.radius_km),
-        "priceTo": str(s.max_price),
-        "sortierung": "date",
+        "keywords": q,
+        "locationStr": plz,
+        "radius": str(radius_km),
+        "priceTo": str(max_price),
+        "sortingField": "SORTING_DATE",
+        "sortingOrder": "DESCENDING",
     }
-    return "https://www.kleinanzeigen.de/s-autos/k0c216?" + urlencode(params)
+    return "https://www.kleinanzeigen.de/s-autos/k0c216?" + urlencode(params, quote_via=quote_plus)
+
+def parse_kleinanzeigen_listings(html: str) -> List[Tuple[str, str]]:
+    """
+    returns list of (listing_id, url)
+    """
+    soup = BeautifulSoup(html, "lxml")
+    links = []
+    for a in soup.select('a[href*="/s-anzeige/"]'):
+        href = a.get("href", "")
+        if not href.startswith("/s-anzeige/"):
+            continue
+        # id steckt oft am ende: .../1234567890-216-xxxx
+        m = re.search(r"/s-anzeige/.*?/(\d{6,})-\d+-", href)
+        listing_id = m.group(1) if m else href
+        full = urljoin("https://www.kleinanzeigen.de", href)
+        links.append((listing_id, full))
+    # dedupe preserve order
+    seen = set()
+    out = []
+    for lid, u in links:
+        key = (lid, u)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((lid, u))
+    return out
+
+def parse_kleinanzeigen_detail(url: str, listing_id: str) -> Optional[Listing]:
+    html = fetch(url)
+    soup = BeautifulSoup(html, "lxml")
+
+    title = normalize_space(soup.select_one("h1").get_text(" ", strip=True) if soup.select_one("h1") else "")
+    if not title:
+        return None
+
+    price_txt = ""
+    price_el = soup.select_one('[data-testid="vip-price"]') or soup.select_one(".boxedarticle--price") or soup.select_one(".aditem-main--middle--price-shipping--price")
+    if price_el:
+        price_txt = normalize_space(price_el.get_text(" ", strip=True))
+    price = parse_price_eur(price_txt)
+
+    # Location
+    loc = ""
+    loc_el = soup.select_one('[data-testid="vip-location"]') or soup.select_one(".boxedarticle--details--text") or soup.select_one(".aditem-main--top--left")
+    if loc_el:
+        loc = normalize_space(loc_el.get_text(" ", strip=True))
+    loc = loc[:80]
+
+    # Has pictures: wenn irgendein Bild in Galerie vorhanden
+    has_pics = bool(soup.select("img"))
+
+    # Year: best effort – Kleinanzeigen ist wild, daher mehrere Versuche
+    year = None
+    text_all = soup.get_text("\n", strip=True).lower()
+
+    # Häufig: "Erstzulassung" oder "Baujahr"
+    m = re.search(r"(erstzulassung|baujahr)\s*[:\n]\s*(\d{4})", text_all, re.IGNORECASE)
+    if m:
+        try:
+            year = int(m.group(2))
+        except:
+            year = None
+    else:
+        # Alternative: "EZ 04/2012" -> 2012
+        m2 = re.search(r"\bez\s+\d{1,2}/(\d{4})\b", text_all, re.IGNORECASE)
+        if m2:
+            try:
+                year = int(m2.group(1))
+            except:
+                year = None
+
+    return Listing(
+        site="kleinanzeigen",
+        listing_id=str(listing_id),
+        title=title,
+        price_eur=price,
+        year=year,
+        location=loc or "—",
+        url=url,
+        has_pictures=has_pics,
+    )
+
+def kleinanzeigen_search(cfg: SearchConfig, limit: int = 20) -> List[Listing]:
+    url = build_kleinanzeigen_search_url(cfg.query_text(), cfg.plz, cfg.radius_km, cfg.max_price_eur)
+    html = fetch(url)
+    pairs = parse_kleinanzeigen_listings(html)[:limit]
+
+    listings: List[Listing] = []
+    for lid, link in pairs:
+        try:
+            li = parse_kleinanzeigen_detail(link, lid)
+            if li:
+                listings.append(li)
+        except Exception:
+            continue
+    return listings
 
 
-def mobile_search_url(s: Search) -> str:
+# =========================
+# MOBILE.DE (best-effort scraping)
+# =========================
+
+def build_mobile_search_url(make: str, model: str, plz: str, radius_km: int, max_price: int, min_year: int) -> str:
+    # Keyword-Suche + Filter. Mobile ist zickig – aber das ist die stabilste "ohne API-key" Variante.
+    # Der Trick: q=<make>+<model> statt nur model
+    q = f"{make} {model}".strip()
     params = {
         "isSearchRequest": "true",
-        "q": s.query,
-        "maxPrice": str(s.max_price),
-        "radius": str(s.radius_km),
-        "zip": s.plz,
         "vc": "Car",
-        "cn": "DE",
+        "dam": "0",
+        "sb": "rel",
+        "ms": "",  # leave blank
+        "lang": "de",
+        "maxPrice": str(max_price),
+        "minFirstRegistrationDate": str(min_year),  # EZ ab Jahr
+        "rad": str(radius_km),
+        "zip": plz,
+        "q": q,
     }
-    return "https://suchen.mobile.de/fahrzeuge/search.html?" + urlencode(params)
+    return "https://suchen.mobile.de/fahrzeuge/search.html?" + urlencode(params, quote_via=quote_plus)
 
-
-# ---------------------------
-# DETAIL PARSERS (trusted year/price)
-# ---------------------------
-
-def kleinanzeigen_detail(url: str) -> Dict:
-    html = get_html(url)
+def parse_mobile_listings(html: str) -> List[Tuple[str, str]]:
     soup = BeautifulSoup(html, "lxml")
-    text = soup.get_text(" ", strip=True)
+    out = []
+    # Links zu detail pages enthalten meist "/fahrzeuge/details.html?id="
+    for a in soup.select('a[href*="/fahrzeuge/details.html"]'):
+        href = a.get("href", "")
+        if "id=" not in href:
+            continue
+        m = re.search(r"id=(\d+)", href)
+        lid = m.group(1) if m else href
+        full = urljoin("https://suchen.mobile.de", href)
+        out.append((lid, full))
+    # dedupe
+    seen = set()
+    res = []
+    for lid, u in out:
+        if (lid, u) in seen:
+            continue
+        seen.add((lid, u))
+        res.append((lid, u))
+    return res
 
-    # title
-    title = ""
-    h1 = soup.select_one("h1")
-    if h1:
-        title = h1.get_text(" ", strip=True)
+def parse_mobile_detail(url: str, listing_id: str) -> Optional[Listing]:
+    html = fetch(url)
+    soup = BeautifulSoup(html, "lxml")
+
+    title = normalize_space(soup.select_one("h1").get_text(" ", strip=True) if soup.select_one("h1") else "")
+    if not title:
+        return None
 
     # price
-    price_text = ""
-    p = soup.select_one("[id='viewad-price'], .boxedarticle--price")
-    if p:
-        price_text = p.get_text(" ", strip=True)
+    price = None
+    price_el = soup.select_one('[data-testid="price-label"]') or soup.select_one('[data-testid="price"]')
+    if price_el:
+        price = parse_price_eur(price_el.get_text(" ", strip=True))
+
+    # year: often "Erstzulassung" somewhere
+    year = None
+    txt = soup.get_text("\n", strip=True)
+    m = re.search(r"Erstzulassung\s*\n\s*([0-9]{2}/)?(\d{4})", txt, re.IGNORECASE)
+    if m:
+        try:
+            year = int(m.group(2))
+        except:
+            year = None
 
     # location
-    location_text = ""
-    loc = soup.select_one("#viewad-locality, .boxedarticle--details--full")
-    if loc:
-        location_text = loc.get_text(" ", strip=True)
+    loc = ""
+    loc_el = soup.select_one('[data-testid="seller-address"]') or soup.select_one('[data-testid="location"]')
+    if loc_el:
+        loc = normalize_space(loc_el.get_text(" ", strip=True))
+    loc = loc[:80]
 
-    # year: Kleinanzeigen often has "Baujahr" in attributes
-    year = None
-    # try structured attribute rows
-    for row in soup.select(".addetailslist--detail, .aditem-main--middle--description"):
-        t = row.get_text(" ", strip=True)
-        if "Baujahr" in t:
-            y = pick_year_from_text(t)
-            if y:
-                year = y
-                break
-    if not year:
-        # fallback: scan whole page for "Baujahr"
-        m = re.search(r"Baujahr\s*[:\-]?\s*(19[5-9]\d|20[0-2]\d)", text)
-        if m:
-            year = int(m.group(1))
+    # pics: details page usually has images if any
+    has_pics = bool(soup.select("img"))
 
-    # images
-    has_img = bool(soup.select_one("img"))  # best effort
+    return Listing(
+        site="mobile",
+        listing_id=str(listing_id),
+        title=title,
+        price_eur=price,
+        year=year,
+        location=loc or "—",
+        url=url,
+        has_pictures=has_pics,
+    )
 
-    return {
-        "title": title,
-        "price_text": price_text,
-        "location_text": location_text,
-        "year": year,
-        "has_img": has_img,
-        "raw_text": text[:2000],
-    }
+def mobile_search(cfg: SearchConfig, limit: int = 20) -> List[Listing]:
+    url = build_mobile_search_url(cfg.make, cfg.model, cfg.plz, cfg.radius_km, cfg.max_price_eur, cfg.min_year)
+    html = fetch(url)
+    pairs = parse_mobile_listings(html)[:limit]
 
-
-def mobile_detail(url: str) -> Dict:
-    html = get_html(url)
-    soup = BeautifulSoup(html, "lxml")
-    text = soup.get_text(" ", strip=True)
-
-    # title
-    title = ""
-    h1 = soup.select_one("h1")
-    if h1:
-        title = h1.get_text(" ", strip=True)
-
-    # price: mobile has lots of variants
-    price_text = ""
-    # try common price containers
-    for sel in [
-        "[data-testid='prime-price']",
-        ".price-block__price",
-        ".vehicle-prices__price",
-        ".vip-price",
-        ".g-col-6 .h3",  # fallback-ish
-    ]:
-        el = soup.select_one(sel)
-        if el:
-            price_text = el.get_text(" ", strip=True)
-            if "€" in price_text or parse_price_eur(price_text) is not None:
-                break
-
-    # year: usually "Erstzulassung" or "Baujahr"
-    year = None
-    m = re.search(r"(Erstzulassung|Baujahr)\s*[:\-]?\s*(19[5-9]\d|20[0-2]\d)", text)
-    if m:
-        year = int(m.group(2))
-
-    # images
-    has_img = bool(soup.select_one("img"))
-
-    return {
-        "title": title,
-        "price_text": price_text,
-        "location_text": "",
-        "year": year,
-        "has_img": has_img,
-        "raw_text": text[:2000],
-    }
-
-
-# ---------------------------
-# SEARCH SCRAPERS (collect URLs)
-# ---------------------------
-
-def scrape_kleinanzeigen_urls(s: Search) -> List[Dict]:
-    url = kleinanzeigen_search_url(s)
-    soup = BeautifulSoup(get_html(url), "lxml")
-    out = []
-    for a in soup.select("a[href*='/s-anzeige/']"):
-        href = a.get("href") or ""
-        if not href:
+    listings: List[Listing] = []
+    for lid, link in pairs:
+        try:
+            li = parse_mobile_detail(link, lid)
+            if li:
+                listings.append(li)
+        except Exception:
             continue
-        if not href.startswith("http"):
-            href = urljoin("https://www.kleinanzeigen.de", href)
-
-        out.append({
-            "source": "kleinanzeigen",
-            "id": href,
-            "url": href,
-        })
-    # de-dupe while keeping order
-    seen = set()
-    uniq = []
-    for x in out:
-        if x["id"] in seen:
-            continue
-        seen.add(x["id"])
-        uniq.append(x)
-    return uniq
+    return listings
 
 
-def scrape_mobile_urls(s: Search) -> List[Dict]:
-    url = mobile_search_url(s)
-    soup = BeautifulSoup(get_html(url), "lxml")
+# =========================
+# FILTERS + DEDUP
+# =========================
 
-    candidates = []
+def matches_filters(li: Listing, cfg: SearchConfig, blacklist: List[str]) -> bool:
+    # Blacklist in title
+    if contains_blacklist(li.title, blacklist):
+        return False
 
-    # multiple selectors (mobile changes a lot)
-    selectors = [
-        "a[href*='/auto-inserat/']",
-        "a[data-testid='result-title']",
-        "a[data-testid='vehicle-result-link']",
-        "a[href*='link.mobile.de/']",
-        "a[href*='www.mobile.de/']",
-    ]
+    # pictures
+    if REQUIRE_PICTURES and li.has_pictures is False:
+        return False
 
-    for sel in selectors:
-        for a in soup.select(sel):
-            href = a.get("href") or ""
-            if not href:
-                continue
-            if href.startswith("/"):
-                href = urljoin("https://suchen.mobile.de", href)
+    # price
+    if li.price_eur is not None and li.price_eur > cfg.max_price_eur:
+        return False
 
-            host = urlparse(href).netloc.lower()
-            if ("mobile.de" not in host) and ("link.mobile.de" not in host):
-                continue
+    # year
+    if li.year is not None and li.year < cfg.min_year:
+        return False
 
-            # only keep real car listings if possible
-            if "/auto-inserat/" not in href and "link.mobile.de" not in host:
-                continue
+    return True
 
-            candidates.append(href)
+def should_send(chat_seen: Dict[str, dict], li: Listing) -> bool:
+    key = f"{li.site}:{li.listing_id}"
+    now = time.time()
+    fp = li.fingerprint()
 
-    # de-dupe while keeping order
-    seen = set()
-    uniq = []
-    for href in candidates:
-        if href in seen:
-            continue
-        seen.add(href)
-        uniq.append({
-            "source": "mobile",
-            "id": href,
-            "url": href,
-        })
-    return uniq
-
-
-# ---------------------------
-# FILTERS
-# ---------------------------
-
-def strict_match_make_model(s: Search, title: str, raw: str) -> bool:
-    t = norm((title or "") + " " + (raw or ""))
-    return (norm(s.make) in t) and (norm(s.model) in t)
-
-
-def passes_filters(s: Search, item: Dict) -> Tuple[bool, str]:
-    title = item.get("title", "")
-    raw = item.get("raw_text", "")
-
-    # strict make/model on mobile (stops “all Audis”)
-    if item.get("source") == "mobile":
-        if not strict_match_make_model(s, title, raw):
-            return False, "no_strict_make_model"
-
-    bad = contains_blacklist(title + " " + raw)
-    if bad:
-        return False, f"blacklist:{bad}"
-
-    if REQUIRE_IMAGES and not item.get("has_img", False):
-        return False, "no_image"
-
-    p = parse_price_eur(item.get("price_text", ""))
-    if p is not None and p > s.max_price:
-        return False, "over_price"
-
-    y = item.get("year")
-    if s.min_year and REQUIRE_TRUSTED_YEAR:
-        # If we require trusted year and we can't find one -> ignore (no wrong years)
-        if y is None:
-            return False, "no_trusted_year"
-        if y < s.min_year:
-            return False, "year_too_old"
-
-    return True, "ok"
-
-
-# ---------------------------
-# DEDUP / SEND
-# ---------------------------
-
-def should_send(chat_id: str, item: Dict, sent_cache: SentCache) -> bool:
-    listing_id = item["id"]
-    title = item.get("title", "")
-    price = item.get("price_text", "")
-    loc = item.get("location_text", "")
-    year = str(item.get("year") or "")
-
-    content_hash = hash_listing(title, price, loc, year, item.get("raw_text", "")[:400])
-
-    sent_cache.setdefault(chat_id, {})
-    prev = sent_cache[chat_id].get(listing_id)
-    ts = now_ts()
-
-    if not prev:
-        sent_cache[chat_id][listing_id] = {"ts": str(ts), "hash": content_hash}
+    if key not in chat_seen:
         return True
 
-    prev_ts = int(prev.get("ts", "0"))
-    prev_hash = prev.get("hash", "")
+    last = chat_seen[key].get("last_sent", 0)
+    old_fp = chat_seen[key].get("fingerprint", "")
 
-    changed = (content_hash != prev_hash)
-    too_old = (ts - prev_ts) >= RESEND_AFTER_SECONDS
+    # wenn geändert -> sofort senden
+    if old_fp != fp:
+        return True
 
-    if changed or too_old:
-        sent_cache[chat_id][listing_id] = {"ts": str(ts), "hash": content_hash}
+    # sonst erst nach 2h wieder
+    if now - last >= RESEND_AFTER_SECONDS:
         return True
 
     return False
 
+def mark_sent(chat_seen: Dict[str, dict], li: Listing):
+    key = f"{li.site}:{li.listing_id}"
+    chat_seen[key] = {
+        "last_sent": time.time(),
+        "fingerprint": li.fingerprint(),
+    }
 
-def format_alert(item: Dict) -> str:
-    src = item.get("source", "")
-    title = (item.get("title") or "").strip()
-    price = (item.get("price_text") or "").strip()
-    loc = (item.get("location_text") or "").strip()
-    year = item.get("year")
-    url = (item.get("url") or "").strip()
-
-    meta = []
-    if year:
-        meta.append(f"📆 BJ {year}")
-    if price:
-        meta.append(f"💶 {price}")
-    if loc:
-        meta.append(f"📍 {loc}")
-    meta.append(f"🔎 {src}")
-
-    return "\n".join([
-        f"🚗 *{title}*",
-        " | ".join(meta),
-        f"🔗 {url}",
-    ])
+def format_listing(li: Listing) -> str:
+    price = f"{li.price_eur} €" if li.price_eur is not None else "—"
+    year = f"{li.year}" if li.year is not None else "—"
+    site = "kleinanzeigen" if li.site == "kleinanzeigen" else "mobile.de"
+    return (
+        f"🚗 <b>{li.title}</b>\n"
+        f"💶 <b>{price}</b> | 🗓️ <b>{year}</b>\n"
+        f"📍 {li.location} | 🔎 <i>{site}</i>\n"
+        f"🔗 {li.url}"
+    )
 
 
-# ---------------------------
+# =========================
 # TELEGRAM COMMANDS
-# ---------------------------
+# =========================
 
-def parse_set_args(text: str) -> Search:
-    # /set Auto Model PLZ Umkreis Preis BJ
-    parts = text.strip().split()
-    if len(parts) < 7:
-        raise ValueError("Format: /set Auto Model PLZ Umkreis Preis BJ (z.B. /set audi a6 67157 300 10000 2010)")
+HELP_DE = (
+    "✅ <b>AutoSuchBot</b>\n\n"
+    "Format:\n"
+    "<code>/set MARKE MODELL PLZ UMKREIS_KM MAX_PREIS MIN_BJ</code>\n\n"
+    "Beispiel:\n"
+    "<code>/set audi a6 67157 300 10000 2010</code>\n\n"
+    "Andere:\n"
+    "<code>/list</code>  – gespeicherte Suchen\n"
+    "<code>/del 1</code> – Suche löschen\n"
+    "<code>/stop</code> – alle Suchen löschen\n"
+)
 
-    make = parts[1]
-    model = parts[2]
-    plz = parts[3]
+HELP_ES = (
+    "✅ <b>AutoSearchBot</b>\n\n"
+    "Formato:\n"
+    "<code>/set MARCA MODELO CP RADIO_KM PRECIO_MAX AÑO_MIN</code>\n\n"
+    "Ejemplo:\n"
+    "<code>/set audi a6 67157 300 10000 2010</code>\n\n"
+    "Otros:\n"
+    "<code>/list</code>  – búsquedas guardadas\n"
+    "<code>/del 1</code> – borrar búsqueda\n"
+    "<code>/stop</code> – borrar todas\n"
+)
 
-    if not re.fullmatch(r"\d{5}", plz):
-        raise ValueError("PLZ muss 5-stellig sein (z.B. 67157).")
-
-    try:
-        radius = int(re.sub(r"\D", "", parts[4]))
-        max_price = int(re.sub(r"\D", "", parts[5]))
-        min_year = int(re.sub(r"\D", "", parts[6]))
-    except:
-        raise ValueError("Umkreis/Preis/BJ müssen Zahlen sein. Beispiel: /set audi a6 67157 300 10000 2010")
-
-    return Search(make=make, model=model, plz=plz, radius_km=radius, max_price=max_price, min_year=min_year)
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "✅ *AutoSuchBot online.*\n\n"
-        "*Benutzung:*\n"
-        "`/set Auto Model PLZ Umkreis Preis BJ`\n"
-        "Beispiel:\n"
-        "`/set audi a6 67157 300 10000 2010`\n\n"
-        "*Andere:*\n"
-        "`/list`  – gespeicherte Suchen\n"
-        "`/del <nr>` – Suche löschen\n"
-        "`/stop`  – alles löschen\n"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    try:
-        s = parse_set_args(update.message.text)
-    except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
-        return
-
-    store: SearchStore = load_json("searches.json", {})
-    store.setdefault(chat_id, [])
-    store[chat_id].append(asdict(s))
-    save_json("searches.json", store)
-
-    ka = kleinanzeigen_search_url(s)
-    mo = mobile_search_url(s)
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ *Suche gespeichert!*\n"
-        f"🚗 `{s.make} {s.model}`\n"
-        f"📍 PLZ `{s.plz}` + `{s.radius_km} km`\n"
-        f"💶 bis `{s.max_price}€`\n"
-        f"📆 ab BJ `{s.min_year}`\n\n"
-        f"🔎 *Kleinanzeigen Suche:*\n{ka}\n\n"
-        f"🔎 *mobile.de Suche:*\n{mo}\n\n"
-        "⏱️ Alerts laufen jetzt automatisch (jede Minute).",
-        parse_mode=ParseMode.MARKDOWN
+        HELP_DE + "\n" + HELP_ES,
+        parse_mode=ParseMode.HTML
     )
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        HELP_DE + "\n" + HELP_ES,
+        parse_mode=ParseMode.HTML
+    )
 
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    store: SearchStore = load_json("searches.json", {})
-    items = store.get(chat_id, [])
-    if not items:
-        await update.message.reply_text("Keine gespeicherten Suchen.")
-        return
+def parse_set_args(args: List[str]) -> Optional[SearchConfig]:
+    # /set audi a6 67157 300 10000 2010
+    if len(args) < 6:
+        return None
+    make = args[0].strip()
+    model = args[1].strip()
+    plz = args[2].strip()
+    try:
+        radius = int(args[3])
+        max_price = int(args[4])
+        min_year = int(re.sub(r"\D", "", args[5]))  # erlaubt bj2010 -> 2010
+    except:
+        return None
 
-    lines = ["📌 *Deine Suchen:*"]
-    for i, d in enumerate(items, start=1):
-        s = Search(**d)
-        lines.append(
-            f"{i}) 🚗 `{s.make} {s.model}` | 📍 `{s.plz}` + `{s.radius_km}km` | 💶 `{s.max_price}€` | 📆 `{s.min_year}`"
+    if radius <= 0 or max_price <= 0 or min_year < 1900 or min_year > 2100:
+        return None
+
+    return SearchConfig(
+        make=make,
+        model=model,
+        plz=plz,
+        radius_km=radius,
+        max_price_eur=max_price,
+        min_year=min_year,
+        created_at=time.time(),
+    )
+
+async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_data_dir()
+    searches = load_searches()
+
+    cfg = parse_set_args(context.args)
+    if not cfg:
+        await update.message.reply_text(
+            "❌ Falsches Format.\n"
+            "Nutze:\n"
+            "<code>/set MARKE MODELL PLZ UMKREIS_KM MAX_PREIS MIN_BJ</code>\n"
+            "Beispiel:\n"
+            "<code>/set audi a6 67157 300 10000 2010</code>\n",
+            parse_mode=ParseMode.HTML
         )
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        return
 
-
-async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    store: SearchStore = load_json("searches.json", {})
-    items = store.get(chat_id, [])
-    if not items:
+    searches.setdefault(chat_id, [])
+    searches[chat_id].append(cfg)
+    save_searches(searches)
+
+    # Sofort einmal prüfen (damit du direkt Links siehst)
+    await update.message.reply_text("✅ Suche gespeichert! Prüfe sofort…")
+    await run_checks_for_chat(chat_id, context.application)
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_data_dir()
+    searches = load_searches()
+    chat_id = str(update.effective_chat.id)
+    lst = searches.get(chat_id, [])
+    if not lst:
         await update.message.reply_text("Keine gespeicherten Suchen.")
         return
 
-    parts = update.message.text.strip().split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await update.message.reply_text("Format: /del 1")
-        return
+    lines = []
+    for i, s in enumerate(lst, start=1):
+        lines.append(
+            f"{i}) 🚗 {s.make} {s.model} | 📍 {s.plz} ({s.radius_km} km) | 💶 bis {s.max_price_eur}€ | 🗓️ ab {s.min_year}"
+        )
+    await update.message.reply_text("\n".join(lines))
 
-    idx = int(parts[1]) - 1
-    if idx < 0 or idx >= len(items):
-        await update.message.reply_text("❌ Nummer existiert nicht. Nutze /list")
-        return
-
-    removed = items.pop(idx)
-    store[chat_id] = items
-    save_json("searches.json", store)
-
-    s = Search(**removed)
-    await update.message.reply_text(f"🗑️ Gelöscht: {s.make} {s.model} ({s.plz})")
-
-
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_data_dir()
+    searches = load_searches()
     chat_id = str(update.effective_chat.id)
-    store: SearchStore = load_json("searches.json", {})
-    store.pop(chat_id, None)
-    save_json("searches.json", store)
+    lst = searches.get(chat_id, [])
 
-    sent: SentCache = load_json("sent_cache.json", {})
-    sent.pop(chat_id, None)
-    save_json("sent_cache.json", sent)
+    if not context.args:
+        await update.message.reply_text("Nutze: /del 1")
+        return
 
-    await update.message.reply_text("🛑 Alles gelöscht. Keine Alerts mehr.")
+    try:
+        idx = int(context.args[0]) - 1
+    except:
+        await update.message.reply_text("Nutze: /del 1")
+        return
+
+    if idx < 0 or idx >= len(lst):
+        await update.message.reply_text("❌ Diese Suche gibt’s nicht.")
+        return
+
+    removed = lst.pop(idx)
+    searches[chat_id] = lst
+    save_searches(searches)
+
+    await update.message.reply_text(f"🗑️ Gelöscht: {removed.make} {removed.model} ({removed.plz})")
+
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_data_dir()
+    searches = load_searches()
+    chat_id = str(update.effective_chat.id)
+    searches[chat_id] = []
+    save_searches(searches)
+    await update.message.reply_text("🛑 Alle Suchen gelöscht.")
 
 
-# ---------------------------
+# =========================
 # CHECK LOOP
-# ---------------------------
+# =========================
 
-async def check_once(app: Application):
-    store: SearchStore = load_json("searches.json", {})
-    sent: SentCache = load_json("sent_cache.json", {})
+async def run_checks_for_chat(chat_id: str, app: Application):
+    ensure_data_dir()
+    searches = load_searches()
+    seen = load_seen()
 
-    for chat_id, searches in store.items():
-        compiled: List[Search] = []
-        for d in searches:
-            try:
-                compiled.append(Search(**d))
-            except:
-                continue
-        if not compiled:
-            continue
+    cfgs = searches.get(chat_id, [])
+    if not cfgs:
+        return
 
-        for s in compiled:
-            # collect URLs
-            items = []
-            try:
-                items += scrape_kleinanzeigen_urls(s)
-            except Exception as e:
-                log.warning("Kleinanzeigen URL scrape failed: %s", e)
+    blacklist = DEFAULT_BLACKLIST
+    seen.setdefault(chat_id, {})
+    chat_seen = seen[chat_id]
 
-            try:
-                items += scrape_mobile_urls(s)
-            except Exception as e:
-                log.warning("mobile URL scrape failed: %s", e)
+    for cfg in cfgs:
+        # Hol Listings (kleinanzeigen + mobile)
+        results: List[Listing] = []
 
-            sent_count = 0
+        try:
+            results += kleinanzeigen_search(cfg, limit=25)
+        except Exception:
+            pass
 
-            # enrich + filter + send (limit requests)
-            for base in items[:200]:
-                src = base["source"]
-                url = base["url"]
+        try:
+            results += mobile_search(cfg, limit=25)
+        except Exception:
+            pass
 
-                try:
-                    if src == "kleinanzeigen":
-                        details = kleinanzeigen_detail(url)
-                    else:
-                        details = mobile_detail(url)
-                except Exception as e:
-                    log.warning("detail fetch failed (%s): %s", src, e)
-                    continue
+        # Filter + sort newest-ish (keine echten timestamps, daher einfach Reihenfolge)
+        matched: List[Listing] = []
+        for li in results:
+            if matches_filters(li, cfg, blacklist):
+                matched.append(li)
 
-                item = {**base, **details}
+        # Senden
+        for li in matched:
+            if should_send(chat_seen, li):
+                await app.bot.send_message(
+                    chat_id=int(chat_id),
+                    text=format_listing(li),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=False
+                )
+                mark_sent(chat_seen, li)
 
-                ok, _reason = passes_filters(s, item)
-                if not ok:
-                    continue
+    save_seen(seen)
 
-                if not should_send(chat_id, item, sent):
-                    continue
-
-                text = format_alert(item)
-                try:
-                    await app.bot.send_message(
-                        chat_id=int(chat_id),
-                        text=text,
-                        parse_mode=ParseMode.MARKDOWN,
-                        disable_web_page_preview=False,
-                    )
-                    sent_count += 1
-                except Exception as e:
-                    log.warning("send_message failed: %s", e)
-
-                if sent_count >= MAX_RESULTS_PER_CHECK:
-                    break
-
-    save_json("sent_cache.json", sent)
+async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
+    ensure_data_dir()
+    searches = load_searches()
+    for chat_id in list(searches.keys()):
+        await run_checks_for_chat(chat_id, context.application)
 
 
-async def job_runner(context: ContextTypes.DEFAULT_TYPE):
-    await check_once(context.application)
-
+# =========================
+# MAIN
+# =========================
 
 def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    ensure_data_dir()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("set", cmd_set))
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("del", cmd_del))
-    app.add_handler(CommandHandler("stop", cmd_stop))
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    app.job_queue.run_repeating(job_runner, interval=CHECK_INTERVAL_SECONDS, first=5)
-    log.info("Bot started.")
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("set", set_cmd))
+    app.add_handler(CommandHandler("list", list_cmd))
+    app.add_handler(CommandHandler("del", del_cmd))
+    app.add_handler(CommandHandler("stop", stop_cmd))
+
+    # Job every minute
+    app.job_queue.run_repeating(scheduled_job, interval=CHECK_INTERVAL_SECONDS, first=5)
+
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
