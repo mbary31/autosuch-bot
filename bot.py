@@ -4,7 +4,7 @@ import json
 import time
 import hashlib
 import logging
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import requests
 from bs4 import BeautifulSoup
@@ -19,12 +19,10 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 BOT_NAME = "AutoSuchBot"
 DATA_FILE = "search_data.json"
 
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))  # ✅ jede Minute
-DEFAULT_RADIUS_KM = 300
-DEFAULT_ONLY_WITH_PHOTOS = True
-
-# ✅ Inserate dürfen alle 2h wiederholt werden
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))  # jede Minute
 RESEND_AFTER_SECONDS = 2 * 60 * 60  # 2 Stunden
+
+DEFAULT_ONLY_WITH_PHOTOS = True
 
 BLACKLIST_WORDS = [
     "unfall",
@@ -38,9 +36,7 @@ BLACKLIST_WORDS = [
     "ohne tuv",
 ]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; AutoSuchBot/2.0)"
-}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AutoSuchBot/3.0)"}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -51,14 +47,12 @@ logger = logging.getLogger(__name__)
 
 def load_data() -> Dict[str, Any]:
     if not os.path.exists(DATA_FILE):
-        return {"searches": [], "seen": {}}  # seen: {key: {hash,last_sent}}
+        return {"searches": [], "seen": {}}
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if "searches" not in data:
-            data["searches"] = []
-        if "seen" not in data:
-            data["seen"] = {}
+        data.setdefault("searches", [])
+        data.setdefault("seen", {})
         return data
     except Exception:
         return {"searches": [], "seen": {}}
@@ -74,24 +68,16 @@ def sha16(s: str) -> str:
 # HELPERS
 # ----------------------------
 
-def parse_int(x: str) -> Optional[int]:
-    try:
-        digits = re.sub(r"[^\d]", "", x)
-        return int(digits) if digits else None
-    except Exception:
-        return None
+def normalize_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
 def contains_blacklist(text: str) -> bool:
     t = (text or "").lower()
     return any(w in t for w in BLACKLIST_WORDS)
 
-def normalize_spaces(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
-
 def parse_price_eur(text: str) -> Optional[int]:
     """
-    Versucht Preis in Euro zu erkennen, z.B. "10.000 €", "9999€", "12.500 € VB".
-    Gibt int (EUR) zurück, sonst None.
+    Erkenne Preise wie "10.000 €", "9999€", "12 500 €".
     """
     if not text:
         return None
@@ -106,13 +92,32 @@ def parse_price_eur(text: str) -> Optional[int]:
         return None
 
 def fingerprint(title: str, price: Optional[int], url: str) -> str:
-    # Wenn sich Titel oder Preis ändert → anderer Fingerprint → wird neu gesendet
     return sha16(f"{normalize_spaces(title).lower()}|{price}|{url}")
 
+def should_send(seen: Dict[str, Any], key: str, new_hash: str, now: int) -> bool:
+    """
+    - nie gesendet -> senden
+    - geändert -> senden
+    - sonst nach 2h wiederholen
+    """
+    rec = seen.get(key)
+    if not rec:
+        return True
+    old_hash = rec.get("hash")
+    last_sent = int(rec.get("last_sent", 0))
+    if old_hash != new_hash:
+        return True
+    if now - last_sent >= RESEND_AFTER_SECONDS:
+        return True
+    return False
+
+def mark_sent(seen: Dict[str, Any], key: str, new_hash: str, now: int) -> None:
+    seen[key] = {"hash": new_hash, "last_sent": now}
+
 # ----------------------------
-# /set Parser (Reihenfolge fix!)
-# Auto/Model/PLZ/Preis/BJ
-# Beispiel: /set Audi a6 67157 10000 bj2010
+# /set Parser
+# Format: Auto/Model PLZ Umkreis Preis BJ
+# Beispiel: /set Audi a6 67157 300 10000 bj2010
 # ----------------------------
 
 def parse_set_args(text: str) -> Dict[str, Any]:
@@ -123,7 +128,7 @@ def parse_set_args(text: str) -> Dict[str, Any]:
 
     parts = raw.split()
 
-    # BJ token "bj2010" optional
+    # optional bjYYYY
     year_from = None
     bj_token = None
     for p in parts:
@@ -135,26 +140,30 @@ def parse_set_args(text: str) -> Dict[str, Any]:
     if bj_token:
         parts.remove(bj_token)
 
-    # Mindest: query... PLZ Preis
-    if len(parts) < 4:
+    # Mindest: query... PLZ RADIUS PRICE
+    if len(parts) < 5:
         return {}
 
-    plz = parts[-2]
+    plz = parts[-3]
+    radius = parts[-2]
     price = parts[-1]
+
     if not re.fullmatch(r"\d{5}", plz):
+        return {}
+    if not re.fullmatch(r"\d{1,4}", radius):
         return {}
     if not re.fullmatch(r"\d{3,8}", price):
         return {}
 
-    query = " ".join(parts[:-2]).strip()
+    query = " ".join(parts[:-3]).strip()
     if not query:
         return {}
 
     return {
         "query": query.lower(),
         "plz": plz,
+        "radius_km": int(radius),
         "price_to": int(price),
-        "radius_km": DEFAULT_RADIUS_KM,
         "year_from": year_from,
         "only_photos": DEFAULT_ONLY_WITH_PHOTOS,
     }
@@ -163,7 +172,7 @@ def parse_set_args(text: str) -> Dict[str, Any]:
 # SEARCH URLS
 # ----------------------------
 
-def build_mobile_url(query: str, price_to: int, plz: str, radius: int, year_from: Optional[int]) -> str:
+def build_mobile_url(query: str, price_to: int, plz: str, radius_km: int, year_from: Optional[int]) -> str:
     base = "https://suchen.mobile.de/fahrzeuge/search.html"
     params = {
         "isSearchRequest": "true",
@@ -172,7 +181,7 @@ def build_mobile_url(query: str, price_to: int, plz: str, radius: int, year_from
         "sb": "rel",
         "cn": "DE",
         "zipcode": plz,
-        "radius": str(radius),
+        "radius": str(radius_km),
         "maxPrice": str(price_to),
         "q": query,
     }
@@ -183,12 +192,13 @@ def build_mobile_url(query: str, price_to: int, plz: str, radius: int, year_from
     return f"{base}?{q}"
 
 def build_kleinanzeigen_url(query: str, price_to: int) -> str:
+    # Kleinanzeigen: wenigstens keywords + max price sauber (Radius via PLZ ist ohne Region-ID nicht zuverlässig)
     base = "https://www.kleinanzeigen.de/s-autos/k0c216"
     q = requests.utils.quote(query)
     return f"{base}?keywords={q}&priceTo={price_to}"
 
 # ----------------------------
-# FETCH RESULTS
+# FETCH
 # ----------------------------
 
 def fetch_html(url: str) -> Optional[str]:
@@ -203,9 +213,9 @@ def fetch_html(url: str) -> Optional[str]:
 
 def fetch_mobile_results(url: str) -> List[Dict[str, Any]]:
     """
-    Robustere mobile-Extraktion:
-    - findet detail links
-    - versucht Preis in der Nähe zu lesen
+    mobile HTML ändert öfter. Wir nehmen breite Heuristik:
+    - alle links auf details.html?id=
+    - Preis aus Umfeld-Text best-effort
     """
     out: List[Dict[str, Any]] = []
     html = fetch_html(url)
@@ -213,23 +223,18 @@ def fetch_mobile_results(url: str) -> List[Dict[str, Any]]:
         return out
 
     soup = BeautifulSoup(html, "lxml")
-
-    # mobile hat häufig Links zu details.html?id=...
-    # Wir nehmen ALLE passenden links, dann dedupe.
-    anchors = soup.select("a[href*='fahrzeuge/details.html']")
+    anchors = soup.select("a[href*='fahrzeuge/details.html?id=']")
     seen = set()
 
     for a in anchors:
         href = (a.get("href") or "").strip()
-        if "details.html" not in href:
+        if not href:
             continue
-
         if href.startswith("/"):
             href = "https://suchen.mobile.de" + href
-
-        # Nur echte detail links
         if "details.html?id=" not in href:
             continue
+        href = href.split("&")[0]
 
         if href in seen:
             continue
@@ -237,9 +242,9 @@ def fetch_mobile_results(url: str) -> List[Dict[str, Any]]:
 
         title = normalize_spaces(a.get_text(" ", strip=True)) or "mobile.de Anzeige"
 
-        # Preis versuchen aus Eltern-Container zu ziehen
-        container = a.find_parent()
+        # Preis aus Parent-Text
         price = None
+        container = a.find_parent()
         if container:
             txt = normalize_spaces(container.get_text(" ", strip=True))
             price = parse_price_eur(txt)
@@ -248,8 +253,8 @@ def fetch_mobile_results(url: str) -> List[Dict[str, Any]]:
             "source": "mobile.de",
             "title": title,
             "url": href,
-            "text": (title).lower(),
-            "has_photo": True,  # mobile hat praktisch immer Bilder
+            "text": title.lower(),
+            "has_photo": True,
             "price": price,
         })
 
@@ -262,8 +267,6 @@ def fetch_kleinanzeigen_results(url: str) -> List[Dict[str, Any]]:
         return out
 
     soup = BeautifulSoup(html, "lxml")
-
-    # Kleinanzeigen: Ergebnis-Kacheln sind oft article/aditem – wir nehmen link heuristisch
     anchors = soup.select("a[href*='/s-anzeige/']")
     seen = set()
 
@@ -271,7 +274,6 @@ def fetch_kleinanzeigen_results(url: str) -> List[Dict[str, Any]]:
         href = (a.get("href") or "").strip()
         if "/s-anzeige/" not in href:
             continue
-
         if href.startswith("/"):
             href = "https://www.kleinanzeigen.de" + href
         href = href.split("?")[0]
@@ -282,14 +284,12 @@ def fetch_kleinanzeigen_results(url: str) -> List[Dict[str, Any]]:
 
         title = normalize_spaces(a.get_text(" ", strip=True)) or "Kleinanzeigen Anzeige"
 
-        # Preis versuchen aus Parent-Text
-        container = a.find_parent()
         price = None
         has_photo = True
+        container = a.find_parent()
         if container:
             txt = normalize_spaces(container.get_text(" ", strip=True))
             price = parse_price_eur(txt)
-            # Bild check (best-effort)
             img = container.find("img")
             has_photo = img is not None
 
@@ -297,7 +297,7 @@ def fetch_kleinanzeigen_results(url: str) -> List[Dict[str, Any]]:
             "source": "Kleinanzeigen",
             "title": title,
             "url": href,
-            "text": (title).lower(),
+            "text": title.lower(),
             "has_photo": has_photo,
             "price": price,
         })
@@ -305,142 +305,61 @@ def fetch_kleinanzeigen_results(url: str) -> List[Dict[str, Any]]:
     return out
 
 # ----------------------------
-# FILTER + SEND RULES
+# FILTER
 # ----------------------------
 
 def passes_filters(item: Dict[str, Any], only_photos: bool, price_to: int) -> bool:
-    # Blacklist
     if contains_blacklist(item.get("title", "") + " " + item.get("text", "")):
         return False
-
-    # Fotos
     if only_photos and not item.get("has_photo", False):
         return False
 
-    # Preis: wenn wir einen Preis erkannt haben, HART prüfen
+    # Preis hart filtern, wenn erkannt
     price = item.get("price")
-    if price is not None and price_to is not None and price > price_to:
+    if price is not None and price > price_to:
         return False
 
     return True
 
-def should_send(seen: Dict[str, Any], key: str, new_hash: str, now: int) -> bool:
-    """
-    Regeln:
-    - noch nie gesendet → senden
-    - wenn sich Fingerprint ändert (Titel/Preis) → senden
-    - sonst wenn älter als 2h → erneut senden
-    """
-    rec = seen.get(key)
-    if not rec:
-        return True
-
-    old_hash = rec.get("hash")
-    last_sent = int(rec.get("last_sent", 0))
-
-    if old_hash != new_hash:
-        return True
-
-    if now - last_sent >= RESEND_AFTER_SECONDS:
-        return True
-
-    return False
-
-def mark_sent(seen: Dict[str, Any], key: str, new_hash: str, now: int) -> None:
-    seen[key] = {"hash": new_hash, "last_sent": now}
-
 # ----------------------------
-# TEXTS
+# Telegram Texts
 # ----------------------------
 
 START_TEXT_DE = f"""✅ {BOT_NAME} online.
 
 ✅ /set Reihenfolge:
-Auto / Modell / PLZ / Preis / BJ
+Auto/Modell  PLZ  Umkreis  Preis  BJ
 
 📌 Beispiel:
- /set Audi a6 67157 10000 bj2010
-
-Bedeutung:
-- Audi a6  = Auto + Modell
-- 67157    = PLZ
-- 10000    = Max Preis (€)
-- bj2010   = Mindest Baujahr (ab 2010)
+ /set Audi a6 67157 300 10000 bj2010
 
 ⏱️ Check: jede Minute
 ✅ Keine Dopplungen
-✅ Wenn Inserat sich ändert → wird erneut geschickt
+✅ Wenn Inserat sich ändert -> sofort nochmal
 ✅ Wiederholung nach 2 Stunden erlaubt
 """
 
 START_TEXT_ES = f"""✅ {BOT_NAME} online.
 
 ✅ Orden de /set:
-Coche / Modelo / Código postal / Precio / Año (BJ)
+Coche/Modelo  CP  Radio  Precio  Año (BJ)
 
 📌 Ejemplo:
- /set Audi a6 67157 10000 bj2010
-
-Significado:
-- Audi a6  = coche + modelo
-- 67157    = código postal
-- 10000    = precio máximo (€)
-- bj2010   = año mínimo (desde 2010)
+ /set Audi a6 67157 300 10000 bj2010
 
 ⏱️ Revisión: cada minuto
 ✅ Sin duplicados
-✅ Si el anuncio cambia → se envía otra vez
-✅ Repetición permitida cada 2 horas
+✅ Si el anuncio cambia -> se envía otra vez
+✅ Repetición cada 2 horas
 """
 
 # ----------------------------
-# TELEGRAM COMMANDS
+# Commands
 # ----------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(START_TEXT_DE)
     await update.message.reply_text(START_TEXT_ES)
-
-async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parsed = parse_set_args(update.message.text or "")
-    if not parsed:
-        await update.message.reply_text(
-            "❌ Falsches Format!\n\n"
-            "✅ Reihenfolge:\nAuto / Modell / PLZ / Preis / BJ\n\n"
-            "Beispiel:\n/set Audi a6 67157 10000 bj2010"
-        )
-        return
-
-    store = load_data()
-    entry = {
-        "chat_id": update.effective_chat.id,
-        "query": parsed["query"],
-        "plz": parsed["plz"],
-        "price_to": parsed["price_to"],
-        "radius_km": parsed["radius_km"],
-        "year_from": parsed["year_from"],
-        "only_photos": parsed["only_photos"],
-    }
-    store["searches"].append(entry)
-    save_data(store)
-
-    mobile_url = build_mobile_url(entry["query"], entry["price_to"], entry["plz"], entry["radius_km"], entry["year_from"])
-    klein_url = build_kleinanzeigen_url(entry["query"], entry["price_to"])
-
-    reply = (
-        "✅ Suche gespeichert!\n\n"
-        f"🚗 {entry['query']}\n"
-        f"📍 PLZ: {entry['plz']} ({entry['radius_km']} km)\n"
-        f"💶 Max Preis: {entry['price_to']}€\n"
-    )
-    if entry["year_from"]:
-        reply += f"📅 ab Baujahr: {entry['year_from']}\n"
-
-    reply += "\n🔎 Kleinanzeigen:\n" + klein_url + "\n\n"
-    reply += "🔎 mobile.de:\n" + mobile_url + "\n\n"
-    reply += "⏱️ Check: jede Minute | Dopplungen: nein | Wiederholung: 2h | Änderungen: sofort"
-
-    await update.message.reply_text(reply)
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     store = load_data()
@@ -454,7 +373,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 Deine gespeicherten Suchen:\n"]
     for i, s in enumerate(items, start=1):
         bj = f" bj{s['year_from']}" if s.get("year_from") else ""
-        lines.append(f"{i}) {s['query']} | {s['plz']} | {s['price_to']}€{bj}")
+        lines.append(f"{i}) {s['query']} | {s['plz']} | {s['radius_km']}km | {s['price_to']}€{bj}")
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -485,58 +404,133 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     store = load_data()
     chat_id = update.effective_chat.id
-
     store["searches"] = [s for s in store.get("searches", []) if s["chat_id"] != chat_id]
-    # auch seen löschen (optional), damit bei Neustart wieder alles neu kommen kann
-    # -> wir lassen seen drin, damit es sauber bleibt
     save_data(store)
-
     await update.message.reply_text("⛔️ Alle Suchen gelöscht (Alerts aus).")
 
+async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parsed = parse_set_args(update.message.text or "")
+    if not parsed:
+        await update.message.reply_text(
+            "❌ Falsches Format!\n\n"
+            "✅ Reihenfolge:\nAuto/Modell PLZ Umkreis Preis BJ\n\n"
+            "Beispiel:\n/set Audi a6 67157 300 10000 bj2010"
+        )
+        return
+
+    store = load_data()
+    entry = {
+        "chat_id": update.effective_chat.id,
+        "query": parsed["query"],
+        "plz": parsed["plz"],
+        "radius_km": parsed["radius_km"],
+        "price_to": parsed["price_to"],
+        "year_from": parsed["year_from"],
+        "only_photos": parsed["only_photos"],
+    }
+    store["searches"].append(entry)
+    save_data(store)
+
+    mobile_url = build_mobile_url(entry["query"], entry["price_to"], entry["plz"], entry["radius_km"], entry["year_from"])
+    klein_url = build_kleinanzeigen_url(entry["query"], entry["price_to"])
+
+    reply = (
+        "✅ Suche gespeichert!\n\n"
+        f"🚗 {entry['query']}\n"
+        f"📍 PLZ: {entry['plz']} ({entry['radius_km']} km)\n"
+        f"💶 Max Preis: {entry['price_to']}€\n"
+    )
+    if entry["year_from"]:
+        reply += f"📅 ab Baujahr: {entry['year_from']}\n"
+
+    reply += "\n🔎 Kleinanzeigen:\n" + klein_url + "\n\n"
+    reply += "🔎 mobile.de:\n" + mobile_url + "\n\n"
+    reply += "Jetzt schicke ich dir einmal ALLE aktuellen Treffer. Danach nur neu/geändert + Wiederholung nach 2h."
+
+    await update.message.reply_text(reply)
+
+    # ✅ Initial Dump: sofort alles Aktuelle schicken (ohne doppelt im Loop zu landen)
+    await send_all_current_hits_once(context, entry)
+
 # ----------------------------
-# ALERT JOB
+# Sending logic
+# ----------------------------
+
+async def send_all_current_hits_once(context: ContextTypes.DEFAULT_TYPE, s: Dict[str, Any]) -> None:
+    """
+    Holt einmal die aktuellen Treffer und sendet sie.
+    Markiert sie als "seen", damit der Minutely-Job nicht sofort wieder alles doppelt ballert.
+    """
+    store = load_data()
+    seen: Dict[str, Any] = store.get("seen", {})
+    now = int(time.time())
+
+    mobile_url = build_mobile_url(s["query"], s["price_to"], s["plz"], s["radius_km"], s.get("year_from"))
+    klein_url = build_kleinanzeigen_url(s["query"], s["price_to"])
+
+    mobile_results = fetch_mobile_results(mobile_url)
+    klein_results = fetch_kleinanzeigen_results(klein_url)
+
+    results = mobile_results + klein_results
+
+    sent_count = 0
+    for item in results:
+        if not passes_filters(item, only_photos=s.get("only_photos", True), price_to=int(s["price_to"])):
+            continue
+
+        key = f"{item['source']}|{item['url']}"
+        new_hash = fingerprint(item.get("title", ""), item.get("price"), item.get("url", ""))
+
+        # beim initial dump: IMMER senden, aber auch als seen markieren
+        price_txt = f"{item['price']}€" if item.get("price") is not None else "Preis ?"
+        msg = (
+            f"🚨 Treffer (Initial)!\n"
+            f"🌍 {item['source']}\n"
+            f"🚗 {item.get('title','')}\n"
+            f"💶 {price_txt}\n"
+            f"🔗 {item['url']}"
+        )
+        await context.bot.send_message(chat_id=s["chat_id"], text=msg)
+        mark_sent(seen, key, new_hash, now)
+        sent_count += 1
+
+    store["seen"] = seen
+    save_data(store)
+
+    await context.bot.send_message(chat_id=s["chat_id"], text=f"✅ Initial-Dump fertig: {sent_count} Treffer gesendet.")
+
+# ----------------------------
+# ALERT JOB (jede Minute)
 # ----------------------------
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     store = load_data()
     searches = store.get("searches", [])
     seen: Dict[str, Any] = store.get("seen", {})
+    now = int(time.time())
 
     if not searches:
         return
 
-    now = int(time.time())
-
     for s in searches:
-        query = s["query"]
-        price_to = int(s["price_to"])
-        plz = s["plz"]
-        radius = int(s.get("radius_km", DEFAULT_RADIUS_KM))
-        year_from = s.get("year_from")  # aktuell nur im mobile-link berücksichtigt
-        only_photos = bool(s.get("only_photos", True))
+        mobile_url = build_mobile_url(s["query"], int(s["price_to"]), s["plz"], int(s["radius_km"]), s.get("year_from"))
+        klein_url = build_kleinanzeigen_url(s["query"], int(s["price_to"]))
 
-        mobile_url = build_mobile_url(query, price_to, plz, radius, year_from)
-        klein_url = build_kleinanzeigen_url(query, price_to)
-
-        # fetch
         mobile_results = fetch_mobile_results(mobile_url)
         klein_results = fetch_kleinanzeigen_results(klein_url)
 
         results = mobile_results + klein_results
 
-        # Filter + dedupe/resend logic
         for item in results:
-            if not passes_filters(item, only_photos=only_photos, price_to=price_to):
+            if not passes_filters(item, only_photos=s.get("only_photos", True), price_to=int(s["price_to"])):
                 continue
 
-            # Key pro Anzeige (Quelle+URL) -> stabil
             key = f"{item['source']}|{item['url']}"
             new_hash = fingerprint(item.get("title", ""), item.get("price"), item.get("url", ""))
 
             if not should_send(seen, key, new_hash, now):
                 continue
 
-            # senden
             price_txt = f"{item['price']}€" if item.get("price") is not None else "Preis ?"
             msg = (
                 f"🚨 Treffer!\n"
@@ -550,13 +544,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 mark_sent(seen, key, new_hash, now)
             except Exception as e:
                 logger.warning(f"send_message error: {e}")
-
-    # speichern (seen kann groß werden -> optional trim)
-    # wir trimmen auf ~50k Einträge, damit Datei nicht explodiert
-    if len(seen) > 50000:
-        # sortiere nach last_sent und behalte neueste 50k
-        items_sorted = sorted(seen.items(), key=lambda kv: int(kv[1].get("last_sent", 0)), reverse=True)[:50000]
-        seen = dict(items_sorted)
 
     store["seen"] = seen
     save_data(store)
