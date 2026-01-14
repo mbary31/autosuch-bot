@@ -19,11 +19,7 @@ from urllib3.util.retry import Retry
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # =========================================================
 # ENV (Railway -> Variables)
@@ -146,7 +142,6 @@ def parse_price_eur(text: str) -> Optional[int]:
 
 def parse_first_registration_year(text: str) -> Optional[int]:
     t = text.replace("\xa0", " ")
-    # gezielt um "Erstzulassung/EZ"
     for key in ["Erstzulassung", "EZ", "Erst-Zulassung", "First registration"]:
         idx = t.lower().find(key.lower())
         if idx != -1:
@@ -154,14 +149,12 @@ def parse_first_registration_year(text: str) -> Optional[int]:
             ym = YEAR_RE.search(window)
             if ym:
                 return int(ym.group(1))
-    # fallback
     ym = YEAR_RE.search(t)
     return int(ym.group(1)) if ym else None
 
 
 def normalize_url(url: str) -> str:
-    url = url.strip().split("#", 1)[0]
-    return url
+    return url.strip().split("#", 1)[0]
 
 
 def dedupe_keep_order(urls: List[str]) -> List[str]:
@@ -175,7 +168,7 @@ def dedupe_keep_order(urls: List[str]) -> List[str]:
 
 
 # =========================================================
-# Fetch (async wrapper around requests)
+# Fetch (async wrapper)
 # =========================================================
 def fetch_sync(url: str, timeout: int) -> Tuple[int, str]:
     try:
@@ -233,13 +226,12 @@ def mobile_search_url(q: str, plz: str, radius: int, max_price: int) -> str:
 
 
 def kleinanzeigen_search_url(q: str, plz: str, radius: int, max_price: int) -> str:
-    # kleinanzeigen ist zickig -> distance UND radius setzen
     base = "https://www.kleinanzeigen.de/s-autos/k0"
     params = {
         "keywords": q,
         "locationStr": plz,
-        "distance": str(radius),
-        "radius": str(radius),
+        "distance": str(radius),  # wichtig
+        "radius": str(radius),    # fallback
         "priceTo": str(max_price),
         "sortingField": "SORTING_DATE",
         "pageNum": "1",
@@ -258,17 +250,10 @@ def extract_mobile_links(html: str) -> List[str]:
         href = a["href"]
         if not href:
             continue
-
-        # mobile detail links
         if "details.html?id=" in href or "/fahrzeuge/details.html" in href:
-            u = urljoin("https://suchen.mobile.de", href)
-            urls.append(normalize_url(u))
-
-        # manchmal kommen auch auto-inserat urls
+            urls.append(normalize_url(urljoin("https://suchen.mobile.de", href)))
         if "mobile.de/auto-inserat/" in href:
-            u = urljoin("https://www.mobile.de", href)
-            urls.append(normalize_url(u))
-
+            urls.append(normalize_url(urljoin("https://www.mobile.de", href)))
     return dedupe_keep_order(urls)
 
 
@@ -277,11 +262,8 @@ def extract_kleinanzeigen_links(html: str) -> List[str]:
     urls: List[str] = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if not href:
-            continue
-        if "/s-anzeige/" in href:
-            u = urljoin("https://www.kleinanzeigen.de", href)
-            urls.append(normalize_url(u))
+        if href and "/s-anzeige/" in href:
+            urls.append(normalize_url(urljoin("https://www.kleinanzeigen.de", href)))
     return dedupe_keep_order(urls)
 
 
@@ -289,9 +271,6 @@ def extract_kleinanzeigen_links(html: str) -> List[str]:
 # Command parsing
 # =========================================================
 def parse_set(args: List[str]) -> Optional[Dict[str, Any]]:
-    """
-    /set <query...> <PLZ> <UMKREIS> <MAX_PREIS> <MIN_BJ>
-    """
     if len(args) < 5:
         return None
 
@@ -315,10 +294,7 @@ def parse_set(args: List[str]) -> Optional[Dict[str, Any]]:
     if not q:
         return None
 
-    if radius < 1:
-        radius = 1
-    if radius > 500:
-        radius = 500
+    radius = max(1, min(radius, 500))
 
     return {
         "q": q,
@@ -367,7 +343,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/del <index>\n"
         "/stop\n"
         "/status\n"
-        "/run  (manueller Sofort-Check + Diagnose)\n\n"
+        "/run  (Sofort-Check + Diagnose)\n\n"
         "Beispiel:\n"
         "`/set bmw 320 d touring 10115 50 12000 2013`",
         parse_mode=ParseMode.MARKDOWN,
@@ -425,9 +401,13 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_state(state)
 
     await update.message.reply_text(
-        "✅ Suche gespeichert:\n" + fmt_search(parsed, len(state["chats"][chat_id]["searches"]) - 1),
+        "✅ Suche gespeichert. Starte ersten Check…",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+    # Sofort einmal prüfen (damit du nicht 5 Minuten wartest)
+    diag = await run_checks_for_chat(chat_id, context.bot, verbose=True)
+    await update.message.reply_text(diag)
 
 
 async def del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -538,7 +518,7 @@ async def run_checks_for_chat(chat_id: str, bot, verbose: bool = False) -> str:
             checked += 1
             ok = await validate_listing_by_details(u, max_price=max_price, min_year=min_year)
 
-            # IMMER markieren (sonst hängt er an denselben Dingern für immer)
+            # immer markieren
             mark_seen(chat_seen, u)
 
             if not ok:
@@ -576,7 +556,6 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     bot = context.bot
     state = load_state()
     chat_ids = list((state.get("chats") or {}).keys())
-
     for chat_id in chat_ids:
         try:
             await run_checks_for_chat(chat_id, bot, verbose=False)
@@ -586,7 +565,7 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = str(update.effective_chat.id)
-    await update.message.reply_text("🔧 Starte manuellen Check…")
+    await update.message.reply_text("🔧 Manueller Check…")
     diag = await run_checks_for_chat(chat_id, context.bot, verbose=True)
     await update.message.reply_text(diag)
 
@@ -610,9 +589,8 @@ def main() -> None:
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("run", run_cmd))
 
-    # Scheduler (wenn JobQueue vorhanden)
     if app.job_queue is None:
-        print("⚠️ JobQueue fehlt. Installiere python-telegram-bot[job-queue]. Scheduler aus.")
+        print("⚠️ JobQueue fehlt. Installiere python-telegram-bot[job-queue]. Scheduler AUS.")
     else:
         app.job_queue.run_repeating(scheduled_job, interval=CHECK_INTERVAL_SECONDS, first=8)
 
